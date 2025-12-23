@@ -2,6 +2,7 @@ use postgres_types::ToSql;
 use tokio_postgres::Row;
 use tokio_postgres::types::FromSql;
 
+#[derive(Debug)]
 pub struct MessagePayload {
     id: i32,
     payload: serde_json::Value,

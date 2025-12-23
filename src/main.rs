@@ -8,7 +8,9 @@ use bb8::{Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 use rand::Rng;
 use serde_json::json;
+use tokio::task::JoinHandle;
 use tokio_postgres::{Config, NoTls};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     errors::{MessageProcessingError, WorkerError},
@@ -31,28 +33,120 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     let conn_pool = Arc::new(Pool::builder().build(manager).await.unwrap());
 
     create_messages_table(&conn_pool).await?;
-    insert_test_messages(&conn_pool, 5).await?;
+    insert_test_messages(&conn_pool, 20).await?;
 
+    let tracker = TaskTracker::new();
+
+    let token = CancellationToken::new();
+
+    let cloned_token = token.clone();
+    let main_tracker = tracker.clone();
+    let worker_count = 5;
     let pool = conn_pool.clone();
-
-    let worker_count = 16;
-
-    let handle = tokio::spawn(async move {
-        loop {
-            for _ in 0..worker_count {
-                let worker_pool_handle = pool.clone();
-                tokio::spawn(async move {
-                    let client = worker_pool_handle.get().await.unwrap();
-                    let _ = worker_run(client).await;
-                });
-            }
-            tokio::time::sleep(tokio::time::Duration::from_mins(1)).await
-        }
-    });
+    let handle = handle_messages(worker_count, pool.clone(), main_tracker, cloned_token).await;
 
     handle.await.unwrap();
 
+    tracker.close();
+    tracker.wait().await;
+
     Ok(())
+}
+
+#[cfg(unix)]
+async fn handle_messages(
+    worker_count: u32,
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    main_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
+) -> JoinHandle<()> {
+    use tokio::signal::unix;
+
+    let mut signal_terminate = signal(SignalKind::terminate()).unwrap();
+    let mut signal_interrupt = signal(SignalKind::interrupt()).unwrap();
+
+    tokio::select! {
+        _ = signal_terminate.recv() => tracing::debug!("Received SIGTERM."),
+        _ = signal_interrupt.recv() => tracing::debug!("Received SIGINT."),
+    };
+    tokio::spawn(async move {
+        loop {
+            let tracker_handle = main_tracker.clone();
+            let signal_tracker_handle = main_tracker.clone();
+            tokio::select! {
+                _ = signal_terminate.recv() => {
+                    cancellation_token.cancel();
+                    signal_tracker_handle.close();
+                    break;
+                },
+                _ = signal_interrupt.recv() => {
+                    cancellation_token.cancel();
+                    signal_tracker_handle.close();
+                    break;
+                },
+                _ = launch_workers(worker_count, pool.clone(), tracker_handle) => {},
+            };
+        }
+    })
+}
+
+#[cfg(windows)]
+async fn handle_messages(
+    worker_count: u32,
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    main_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
+) -> JoinHandle<()> {
+    use tokio::signal::windows;
+
+    let mut signal_c = windows::ctrl_c().unwrap();
+    let mut signal_break = windows::ctrl_break().unwrap();
+    let mut signal_close = windows::ctrl_close().unwrap();
+    let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let tracker_handle = main_tracker.clone();
+            let signal_tracker_handle = main_tracker.clone();
+            tokio::select! {
+                _ = signal_c.recv() => {
+                    cancellation_token.cancel();
+                    signal_tracker_handle.close();
+                    break;
+                },
+                _ = signal_break.recv() => {
+                    cancellation_token.cancel();
+                    signal_tracker_handle.close();
+                    break;
+                },
+                _ = signal_close.recv() => {
+                    cancellation_token.cancel();
+                    signal_tracker_handle.close();
+                    break;
+                },
+                _ = signal_shutdown.recv() => {
+                    cancellation_token.cancel();
+                    signal_tracker_handle.close();
+                    break;
+                },
+                _ = launch_workers(worker_count, pool.clone(), tracker_handle) => {},
+            };
+        }
+    })
+}
+
+async fn launch_workers(
+    worker_count: u32,
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    tracker: TaskTracker,
+) {
+    for _ in 0..worker_count {
+        let worker_pool_handle = pool.clone();
+        tracker.spawn(async move {
+            let client = worker_pool_handle.get().await.unwrap();
+            let _ = worker_run(client).await;
+        });
+    }
+    tokio::time::sleep(tokio::time::Duration::from_mins(1)).await
 }
 
 type PoolConnection<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
@@ -86,6 +180,7 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
         .await?;
 
     transaction.commit().await?;
+    println!("task completed {:?}\n", message);
     Ok(())
 }
 
@@ -99,8 +194,8 @@ async fn process_message(
     // rng needs to be dropped before await, can't be held across an await point
     let (delay, should_error) = {
         let mut rng = rand::rng();
-        let delay = rng.random_range(1..=1000);
-        let should_error = rng.random_ratio(4, 5);
+        let delay = rng.random_range(1000..=5000);
+        let should_error = rng.random_ratio(5, 100);
         (delay, should_error)
     };
 
