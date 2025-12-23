@@ -1,4 +1,6 @@
+mod errors;
 mod message;
+mod retry;
 
 use std::sync::Arc;
 
@@ -8,7 +10,11 @@ use rand::Rng;
 use serde_json::json;
 use tokio_postgres::{Config, NoTls};
 
-use crate::message::{JobStatus, MessagePayload};
+use crate::{
+    errors::{MessageProcessingError, WorkerError},
+    message::{JobStatus, MessagePayload},
+    retry::{RetryStrategy, retry},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), tokio_postgres::Error> {
@@ -25,7 +31,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     let conn_pool = Arc::new(Pool::builder().build(manager).await.unwrap());
 
     create_messages_table(&conn_pool).await?;
-    insert_test_messages(&conn_pool, 50).await?;
+    insert_test_messages(&conn_pool, 5).await?;
 
     let pool = conn_pool.clone();
 
@@ -37,7 +43,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
                 let worker_pool_handle = pool.clone();
                 tokio::spawn(async move {
                     let client = worker_pool_handle.get().await.unwrap();
-                    let error = worker_run(client).await;
+                    let _ = worker_run(client).await;
                 });
             }
             tokio::time::sleep(tokio::time::Duration::from_mins(1)).await
@@ -51,7 +57,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
 type PoolConnection<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
 
-async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), tokio_postgres::Error> {
+async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
     let statement = "WITH task AS (SELECT * FROM messages WHERE status = 'pending' ORDER BY created_at DESC FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE messages SET status = 'in_progress' FROM task
     WHERE messages.id = task.id RETURNING task.*";
     let transaction = connection.transaction().await?;
@@ -62,17 +68,15 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), tokio_post
     };
 
     let message = MessagePayload::try_from(row)?;
-    println!("payload: {:?}", message.payload());
 
-    // this is just to have a simulated processing time
-    // rng needs to be dropped before await, can't be held across an await point
-    let delay = {
-        let mut rng = rand::rng();
-        rng.random_range(1..=1000)
-    };
-    // is processing the task fallible as well?
-    // might need to put a timeout in case we want to avoid really long running tasks
-    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+    retry(
+        RetryStrategy::ExponentialBackoff {
+            max_attempts: 5,
+            duration: tokio::time::Duration::from_millis(1000),
+        },
+        || process_message(message.id(), message.payload()),
+    )
+    .await?;
 
     transaction
         .execute(
@@ -82,6 +86,33 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), tokio_post
         .await?;
 
     transaction.commit().await?;
+    Ok(())
+}
+
+async fn process_message(
+    id: i32,
+    payload: &serde_json::Value,
+) -> Result<(), MessageProcessingError> {
+    println!("message: {id}\n payload: {:?}", payload);
+
+    // this is just to have a simulated processing time
+    // rng needs to be dropped before await, can't be held across an await point
+    let (delay, should_error) = {
+        let mut rng = rand::rng();
+        let delay = rng.random_range(1..=1000);
+        let should_error = rng.random_ratio(4, 5);
+        (delay, should_error)
+    };
+
+    // is processing the task async as well?
+    // might need to put a timeout in case we want to avoid really long running tasks
+    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+
+    // should error is used to simulate task failing
+    if should_error {
+        return Err(MessageProcessingError::Fail);
+    }
+
     Ok(())
 }
 
