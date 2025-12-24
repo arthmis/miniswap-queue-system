@@ -8,14 +8,14 @@ use bb8::{Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 use rand::Rng;
 use serde_json::json;
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time};
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     errors::{MessageProcessingError, WorkerError},
     message::{JobStatus, MessagePayload},
-    retry::{RetryStrategy, retry},
+    retry::{RetryStrategy, Retryable, retry},
 };
 
 #[tokio::main]
@@ -163,14 +163,12 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
 
     let message = MessagePayload::try_from(row)?;
 
-    retry(
-        RetryStrategy::ExponentialBackoff {
+    (|| process_message(message.id(), message.payload()))
+        .retry_if_error(RetryStrategy::ExponentialBackoff {
             max_attempts: 5,
-            duration: tokio::time::Duration::from_millis(1000),
-        },
-        || process_message(message.id(), message.payload()),
-    )
-    .await?;
+            duration: time::Duration::from_millis(1000),
+        })
+        .await?;
 
     transaction
         .execute(
@@ -195,7 +193,7 @@ async fn process_message(
     let (delay, should_error) = {
         let mut rng = rand::rng();
         let delay = rng.random_range(1000..=5000);
-        let should_error = rng.random_ratio(5, 100);
+        let should_error = rng.random_ratio(60, 100);
         (delay, should_error)
     };
 

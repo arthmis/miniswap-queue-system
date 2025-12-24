@@ -353,6 +353,7 @@ dependencies = [
  "bb8",
  "bb8-postgres",
  "chrono",
+ "pin-project-lite",
  "postgres-types",
  "rand",
  "serde_json",
