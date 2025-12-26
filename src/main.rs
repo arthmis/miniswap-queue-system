@@ -11,6 +11,7 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Level;
 
 use crate::{
     errors::{MessageProcessingError, WorkerError},
@@ -20,6 +21,12 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<(), tokio_postgres::Error> {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_file(true)
+        .with_line_number(true)
+        .init();
+
     let mut config = Config::new();
     config
         .user("miniswap")
