@@ -191,6 +191,7 @@ async fn handle_failed_and_stuck_messages(
         let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
             _ = handle_stuck_jobs(pool.get().await.unwrap()) => {
+                time::sleep(Duration::from_mins(1)).await;
             },
             _ = signal_c.recv() => {
                 cancellation_token.cancel();
