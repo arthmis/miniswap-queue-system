@@ -222,6 +222,7 @@ async fn handle_stuck_jobs(mut connection: PoolConnection<'_>) -> Result<(), Wor
         SELECT * FROM messages
         WHERE status = 'in_progress'
         AND started_at < NOW() - INTERVAL '5 minutes'
+        ORDER BY priority ASC
         FOR UPDATE SKIP LOCKED LIMIT 1
         )
         UPDATE messages SET status = 'in_progress',
@@ -264,7 +265,7 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
     let statement = "WITH task AS (
         SELECT * FROM messages
         WHERE status = 'pending'
-        ORDER BY created_at DESC
+        ORDER BY priority ASC, created_at DESC
         FOR UPDATE SKIP LOCKED LIMIT 1
         )
         UPDATE messages SET status = 'in_progress',
@@ -348,6 +349,7 @@ async fn create_messages_table(
                 id SERIAL PRIMARY KEY,
                 queue_name TEXT NOT NULL,
                 payload JSONB,
+                priority INTEGER NOT NULL,
                 status job_status NOT NULL DEFAULT 'pending',
                 last_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -389,29 +391,30 @@ async fn insert_test_messages(
                 let queue_name = queue_names[rng.random_range(0..queue_names.len())];
                 let action = actions[rng.random_range(0..actions.len())];
                 let entity = entities[rng.random_range(0..entities.len())];
+                let priority = rng.random_range(0..=4); // 0 = highest priority, 4 = lowest
 
                 let payload = json!({
                     "action": action,
                     "entity": entity,
                     "entity_id": rng.random_range(1000..9999),
                     "amount": rng.random_range(10.0..1000.0_f64),
-                    "priority": rng.random_range(1..5),
+                    "priority": priority,
                     "metadata": {
                         "source": format!("system_{}", rng.random_range(1..10)),
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                         "retry_count": 0
                     }
                 });
-                payloads.push((queue_name, payload));
+                payloads.push((queue_name, payload, priority));
             }
             payloads
         };
 
-        for (queue_name, payload) in payloads {
+        for (queue_name, payload, priority) in payloads {
             client
                 .execute(
-                    "INSERT INTO messages (queue_name, payload, status) VALUES ($1, $2, $3)",
-                    &[&queue_name, &payload, &JobStatus::Pending],
+                    "INSERT INTO messages (queue_name, payload, priority, status) VALUES ($1, $2, $3, $4)",
+                    &[&queue_name, &payload, &priority, &JobStatus::Pending],
                 )
                 .await?;
         }
