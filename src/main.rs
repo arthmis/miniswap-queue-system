@@ -8,7 +8,7 @@ use bb8::{Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 #[cfg(windows)]
 use futures::channel::mpsc::UnboundedReceiver;
-use futures::{FutureExt, StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use rand::Rng;
 use serde_json::json;
 use tokio::time::{self, sleep};
@@ -79,6 +79,8 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     let token = CancellationToken::new();
 
+    let task_count: u32 = 6;
+
     let cloned_token = token.clone();
     let main_tracker = tracker.clone();
     let pool = conn_pool.clone();
@@ -89,7 +91,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
             cloned_token.clone(),
             receiver,
         ),
-        handle_failed_and_stuck_messages(pool.clone(), main_tracker, cloned_token)
+        handle_failed_and_stuck_messages(task_count, pool.clone(), main_tracker, cloned_token)
     );
 
     tracker.close();
@@ -169,7 +171,7 @@ async fn handle_messages(
 
                         });
                     },
-                    Some(n) => info!("{:?}", n),
+                    Some(n) => debug!("{:?}", n),
                     _ => info!("No notification sent."),
                 };
             },
@@ -199,6 +201,7 @@ async fn handle_messages(
 
 #[cfg(windows)]
 async fn handle_failed_and_stuck_messages(
+    task_count: u32,
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
@@ -213,7 +216,7 @@ async fn handle_failed_and_stuck_messages(
     loop {
         let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
-            _ = handle_stuck_jobs(pool.get().await.unwrap()) => {
+            _ = schedule_stuck_jobs(task_count, pool.clone(), main_tracker.clone()) => {
                 time::sleep(Duration::from_mins(1)).await;
             },
             _ = signal_c.recv() => {
@@ -240,8 +243,16 @@ async fn handle_failed_and_stuck_messages(
     }
 }
 
-async fn handle_stuck_jobs(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
-    let statement = "WITH task AS (
+async fn schedule_stuck_jobs(
+    task_count: u32,
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    task_tracker: TaskTracker,
+) -> Result<(), WorkerError> {
+    async fn handle_stuck_job(
+        cloned_pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    ) -> Result<(), WorkerError> {
+        let mut connection = cloned_pool.get().await.unwrap();
+        let statement = "WITH task AS (
         SELECT * FROM messages
         WHERE status = 'in_progress'
         AND started_at < NOW() - INTERVAL '5 minutes'
@@ -252,33 +263,67 @@ async fn handle_stuck_jobs(mut connection: PoolConnection<'_>) -> Result<(), Wor
         last_started_at = NOW()
         FROM task
         WHERE messages.id = task.id RETURNING task.*";
-    let transaction = connection.transaction().await?;
-    let result = transaction.query_opt(statement, &[]).await;
+        let transaction = connection.transaction().await?;
+        let result = transaction.query_opt(statement, &[]).await;
 
-    let Ok(Some(row)) = result else {
-        return Ok(());
-    };
+        let Ok(Some(row)) = result else {
+            return Ok(());
+        };
 
-    let message = MessagePayload::try_from(row)?;
-
-    retry(
-        RetryStrategy::ExponentialBackoff {
-            max_attempts: 5,
-            duration: tokio::time::Duration::from_millis(1000),
-        },
-        || process_message(message.id(), message.payload()),
-    )
-    .await?;
-
-    transaction
-        .execute(
-            "UPDATE messages SET status = 'completed' WHERE id = $1",
-            &[&message.id()],
+        let message = MessagePayload::try_from(row)?;
+        let message_result = retry(
+            RetryStrategy::ExponentialBackoff {
+                max_attempts: 5,
+                duration: tokio::time::Duration::from_millis(1000),
+            },
+            || process_task(message.id(), message.payload()),
         )
-        .await?;
+        .await;
+        if let Err(err) = message_result {
+            error!(
+                "Error processing message for message id: {}\nerror: {:?}",
+                message.id(),
+                err
+            );
+            return Err(err.into());
+        }
 
-    transaction.commit().await?;
-    println!("task completed {:?}\n", message);
+        let status_update_result = transaction
+            .execute(
+                "UPDATE messages SET status = 'completed' WHERE id = $1",
+                &[&message.id()],
+            )
+            .await;
+        let updated_row_count = match status_update_result {
+            Ok(updated_row_count) => updated_row_count,
+            Err(err) => {
+                error!(
+                    "Error updating status of task with id: {}\nerror: {:?}",
+                    message.id(),
+                    err
+                );
+                return Err(err.into());
+            }
+        };
+        assert_eq!(updated_row_count, 1);
+
+        if let Err(err) = transaction.commit().await {
+            error!(
+                "Error completing transaction for task with id: {}\nerror: {:?}",
+                message.id(),
+                err
+            );
+            return Err(err.into());
+        }
+
+        debug!("Task completed - id: {}", message.id());
+        Ok(())
+    }
+
+    for _ in 0..task_count {
+        let cloned_pool = pool.clone();
+        task_tracker.spawn(handle_stuck_job(cloned_pool));
+    }
     Ok(())
 }
 
@@ -308,7 +353,7 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
             max_attempts: 5,
             duration: tokio::time::Duration::from_millis(1000),
         },
-        || process_message(message.id(), message.payload()),
+        || process_task(message.id(), message.payload()),
     )
     .await?;
 
@@ -324,11 +369,8 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
     Ok(())
 }
 
-async fn process_message(
-    id: i32,
-    payload: &serde_json::Value,
-) -> Result<(), MessageProcessingError> {
-    println!("message: {id}\n payload: {:?}", payload);
+async fn process_task(id: i32, payload: &serde_json::Value) -> Result<(), MessageProcessingError> {
+    println!("task: {id}\npayload: {:?}\n", payload);
 
     // this is just to have a simulated processing time
     // rng needs to be dropped before await, can't be held across an await point
