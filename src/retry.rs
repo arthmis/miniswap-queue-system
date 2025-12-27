@@ -2,6 +2,7 @@ use std::error::Error;
 
 use tokio::time::Duration;
 use tokio_stream::StreamExt;
+use tracing::error;
 
 /// Retries the given future using configuration provided by `[RetryStrategy]`
 ///
@@ -42,8 +43,9 @@ where
         tokio::time::sleep(delay).await;
         let future = future_producer();
         output = future.await;
-        if output.is_ok() {
-            return output;
+        match output {
+            Ok(output) => return Ok(output),
+            Err(ref err) => error!("Error processing message: {:?}", err),
         }
     }
 

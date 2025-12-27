@@ -15,6 +15,8 @@ use tokio::time::{self, sleep};
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Level;
+use tracing::debug;
+use tracing::error;
 use tracing::info;
 
 use crate::{
@@ -42,14 +44,21 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     let listen_config = config.clone();
     let manager = PostgresConnectionManager::new(config, NoTls);
-    let conn_pool = Arc::new(Pool::builder().build(manager).await.unwrap());
+    let conn_pool = match Pool::builder().build(manager).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            error!("{:?}", err);
+            panic!("expected to make a connection to the database");
+        }
+    };
+    let conn_pool = Arc::new(conn_pool);
 
     let (sender, receiver) = futures::channel::mpsc::unbounded();
     let (client, mut connection) = listen_config.connect(NoTls).await.unwrap();
 
     let stream = stream::poll_fn(move |context| connection.poll_message(context))
         .map_err(|e| panic!("{}", e));
-    let listen_connection = stream.forward(sender).map(|r| r.unwrap());
+    let listen_connection = stream.forward(sender);
     tokio::spawn(listen_connection);
 
     client.execute("LISTEN new_task", &[]).await.unwrap();
@@ -98,8 +107,10 @@ async fn handle_messages(
 ) {
     use tokio::signal::unix;
 
-    let mut signal_terminate = signal(SignalKind::terminate()).unwrap();
-    let mut signal_interrupt = signal(SignalKind::interrupt()).unwrap();
+    let mut signal_terminate =
+        signal(SignalKind::terminate()).expect("signal terminate to be available");
+    let mut signal_interrupt =
+        signal(SignalKind::interrupt()).expect("signal interrupt to be available");
 
     loop {
         let tracker_handle = main_tracker.clone();
@@ -129,10 +140,10 @@ async fn handle_messages(
 ) {
     use tokio::signal::windows;
 
-    let mut signal_c = windows::ctrl_c().unwrap();
-    let mut signal_break = windows::ctrl_break().unwrap();
-    let mut signal_close = windows::ctrl_close().unwrap();
-    let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
+    let mut signal_c = windows::ctrl_c().expect("ctrl c to be available");
+    let mut signal_break = windows::ctrl_break().expect("ctrl break to be available");
+    let mut signal_close = windows::ctrl_close().expect("ctrl_close to be available");
+    let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl_shutdown to be available");
 
     loop {
         let signal_tracker_handle = main_tracker.clone();
@@ -142,8 +153,20 @@ async fn handle_messages(
                     Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
                         let worker_pool_handle = pool.clone();
                         main_tracker.spawn(async move {
-                            let client = worker_pool_handle.get().await.unwrap();
-                            let _ = worker_run(client).await;
+                            let client = retry(
+                                RetryStrategy::ExponentialBackoff {
+                                    max_attempts: 3,
+                                    duration: Duration::from_millis(50)
+                                },
+                                || worker_pool_handle.get()
+                            ).await;
+                            match client {
+                                Ok(client) => {
+                                    let _ = worker_run(client).await;
+                                },
+                                Err(err) => error!("Couldn't get a connection to pool within 3 retries:\n{:?}", err),
+                            };
+
                         });
                     },
                     Some(n) => info!("{:?}", n),
@@ -182,10 +205,10 @@ async fn handle_failed_and_stuck_messages(
 ) {
     use tokio::signal::windows;
 
-    let mut signal_c = windows::ctrl_c().unwrap();
-    let mut signal_break = windows::ctrl_break().unwrap();
-    let mut signal_close = windows::ctrl_close().unwrap();
-    let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
+    let mut signal_c = windows::ctrl_c().expect("ctrl c to be available");
+    let mut signal_break = windows::ctrl_break().expect("ctrl break to be available");
+    let mut signal_close = windows::ctrl_close().expect("ctrl close to be available");
+    let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl shutdown to be available");
 
     loop {
         let signal_tracker_handle = main_tracker.clone();
@@ -275,7 +298,9 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
     let transaction = connection.transaction().await?;
     let result = transaction.query_opt(statement, &[]).await;
 
-    let row = result.unwrap().unwrap();
+    let Some(row) = result? else {
+        return Ok(());
+    };
     let message = MessagePayload::try_from(row)?;
 
     retry(
@@ -295,7 +320,7 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
         .await?;
 
     transaction.commit().await?;
-    println!("task completed {:?}\n", message);
+    debug!("Task completed - id: {}", message.id());
     Ok(())
 }
 
