@@ -11,10 +11,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use rand::Rng;
 use serde_json::json;
-use tokio::{
-    task::JoinHandle,
-    time::{self, sleep},
-};
+use tokio::time::{self, sleep};
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Level;
@@ -76,9 +73,15 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     let cloned_token = token.clone();
     let main_tracker = tracker.clone();
     let pool = conn_pool.clone();
-    let handle = handle_messages(pool.clone(), main_tracker, cloned_token, receiver).await;
-
-    handle.await.unwrap();
+    tokio::join!(
+        handle_messages(
+            pool.clone(),
+            main_tracker.clone(),
+            cloned_token.clone(),
+            receiver,
+        ),
+        handle_failed_and_stuck_messages(pool.clone(), main_tracker, cloned_token)
+    );
 
     tracker.close();
     tracker.wait().await;
@@ -92,35 +95,29 @@ async fn handle_messages(
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
-) -> JoinHandle<()> {
+) {
     use tokio::signal::unix;
 
     let mut signal_terminate = signal(SignalKind::terminate()).unwrap();
     let mut signal_interrupt = signal(SignalKind::interrupt()).unwrap();
 
-    tokio::select! {
-        _ = signal_terminate.recv() => tracing::debug!("Received SIGTERM."),
-        _ = signal_interrupt.recv() => tracing::debug!("Received SIGINT."),
-    };
-    tokio::spawn(async move {
-        loop {
-            let tracker_handle = main_tracker.clone();
-            let signal_tracker_handle = main_tracker.clone();
-            tokio::select! {
-                _ = signal_terminate.recv() => {
-                    cancellation_token.cancel();
-                    signal_tracker_handle.close();
-                    break;
-                },
-                _ = signal_interrupt.recv() => {
-                    cancellation_token.cancel();
-                    signal_tracker_handle.close();
-                    break;
-                },
-                _ = launch_workers(worker_count, pool.clone(), tracker_handle) => {},
-            };
-        }
-    })
+    loop {
+        let tracker_handle = main_tracker.clone();
+        let signal_tracker_handle = main_tracker.clone();
+        tokio::select! {
+            _ = signal_terminate.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_interrupt.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = launch_workers(worker_count, pool.clone(), tracker_handle) => {},
+        };
+    }
 }
 
 #[cfg(windows)]
@@ -129,7 +126,7 @@ async fn handle_messages(
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
     mut receiver: UnboundedReceiver<tokio_postgres::AsyncMessage>,
-) -> JoinHandle<()> {
+) {
     use tokio::signal::windows;
 
     let mut signal_c = windows::ctrl_c().unwrap();
@@ -137,68 +134,99 @@ async fn handle_messages(
     let mut signal_close = windows::ctrl_close().unwrap();
     let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
 
-    tokio::spawn(async move {
-        loop {
-            let signal_tracker_handle = main_tracker.clone();
-            tokio::select! {
-                message = receiver.next() => {
-                    match message {
-                        Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
-                            let worker_pool_handle = pool.clone();
-                            main_tracker.spawn(async move {
-                                let client = worker_pool_handle.get().await.unwrap();
-                                let _ = worker_run(client).await;
-                            });
-                        },
-                        Some(n) => info!("{:?}", n),
-                        _ => info!("No notification sent."),
-                    };
-                },
-                _ = signal_c.recv() => {
-                    cancellation_token.cancel();
-                    signal_tracker_handle.close();
-                    break;
-                },
-                _ = signal_break.recv() => {
-                    cancellation_token.cancel();
-                    signal_tracker_handle.close();
-                    break;
-                },
-                _ = signal_close.recv() => {
-                    cancellation_token.cancel();
-                    signal_tracker_handle.close();
-                    break;
-                },
-                _ = signal_shutdown.recv() => {
-                    cancellation_token.cancel();
-                    signal_tracker_handle.close();
-                    break;
-                },
-            }
+    loop {
+        let signal_tracker_handle = main_tracker.clone();
+        tokio::select! {
+            message = receiver.next() => {
+                match message {
+                    Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
+                        let worker_pool_handle = pool.clone();
+                        main_tracker.spawn(async move {
+                            let client = worker_pool_handle.get().await.unwrap();
+                            let _ = worker_run(client).await;
+                        });
+                    },
+                    Some(n) => info!("{:?}", n),
+                    _ => info!("No notification sent."),
+                };
+            },
+            _ = signal_c.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_break.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_close.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_shutdown.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
         }
-    })
-}
-
-async fn launch_workers(
-    worker_count: u32,
-    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
-    tracker: TaskTracker,
-) {
-    for _ in 0..worker_count {
-        let worker_pool_handle = pool.clone();
-        tracker.spawn(async move {
-            let client = worker_pool_handle.get().await.unwrap();
-            let _ = worker_run(client).await;
-        });
     }
-    tokio::time::sleep(tokio::time::Duration::from_mins(1)).await
 }
 
-type PoolConnection<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
+#[cfg(windows)]
+async fn handle_failed_and_stuck_messages(
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    main_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
+) {
+    use tokio::signal::windows;
 
-async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
-    let statement = "WITH task AS (SELECT * FROM messages WHERE status = 'pending' ORDER BY created_at DESC FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE messages SET status = 'in_progress' FROM task
-    WHERE messages.id = task.id RETURNING task.*";
+    let mut signal_c = windows::ctrl_c().unwrap();
+    let mut signal_break = windows::ctrl_break().unwrap();
+    let mut signal_close = windows::ctrl_close().unwrap();
+    let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
+
+    loop {
+        let signal_tracker_handle = main_tracker.clone();
+        tokio::select! {
+            _ = handle_stuck_jobs(pool.get().await.unwrap()) => {
+            },
+            _ = signal_c.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_break.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_close.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+            _ = signal_shutdown.recv() => {
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+                break;
+            },
+        }
+    }
+}
+
+async fn handle_stuck_jobs(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
+    let statement = "WITH task AS (
+        SELECT * FROM messages
+        WHERE status = 'in_progress'
+        AND started_at < NOW() - INTERVAL '5 minutes'
+        FOR UPDATE SKIP LOCKED LIMIT 1
+        )
+        UPDATE messages SET status = 'in_progress',
+        last_started_at = NOW()
+        FROM task
+        WHERE messages.id = task.id RETURNING task.*";
     let transaction = connection.transaction().await?;
     let result = transaction.query_opt(statement, &[]).await;
 
@@ -206,6 +234,46 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
         return Ok(());
     };
 
+    let message = MessagePayload::try_from(row)?;
+
+    retry(
+        RetryStrategy::ExponentialBackoff {
+            max_attempts: 5,
+            duration: tokio::time::Duration::from_millis(1000),
+        },
+        || process_message(message.id(), message.payload()),
+    )
+    .await?;
+
+    transaction
+        .execute(
+            "UPDATE messages SET status = 'completed' WHERE id = $1",
+            &[&message.id()],
+        )
+        .await?;
+
+    transaction.commit().await?;
+    println!("task completed {:?}\n", message);
+    Ok(())
+}
+
+type PoolConnection<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
+
+async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
+    let statement = "WITH task AS (
+        SELECT * FROM messages
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        FOR UPDATE SKIP LOCKED LIMIT 1
+        )
+        UPDATE messages SET status = 'in_progress',
+        last_started_at = NOW()
+        FROM task
+        WHERE messages.id = task.id RETURNING task.*";
+    let transaction = connection.transaction().await?;
+    let result = transaction.query_opt(statement, &[]).await;
+
+    let row = result.unwrap().unwrap();
     let message = MessagePayload::try_from(row)?;
 
     retry(
@@ -280,6 +348,7 @@ async fn create_messages_table(
                 queue_name TEXT NOT NULL,
                 payload JSONB,
                 status job_status NOT NULL DEFAULT 'pending',
+                last_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
