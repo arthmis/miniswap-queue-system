@@ -2,16 +2,23 @@ mod errors;
 mod message;
 mod retry;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use bb8::{Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
+#[cfg(windows)]
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use rand::Rng;
 use serde_json::json;
-use tokio::task::JoinHandle;
+use tokio::{
+    task::JoinHandle,
+    time::{self, sleep},
+};
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Level;
+use tracing::info;
 
 use crate::{
     errors::{MessageProcessingError, WorkerError},
@@ -22,7 +29,7 @@ use crate::{
 #[tokio::main]
 async fn main() -> Result<(), tokio_postgres::Error> {
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_max_level(Level::INFO)
         .with_file(true)
         .with_line_number(true)
         .init();
@@ -36,11 +43,31 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         .port(7777)
         .connect_timeout(core::time::Duration::from_secs(10));
 
+    let listen_config = config.clone();
     let manager = PostgresConnectionManager::new(config, NoTls);
     let conn_pool = Arc::new(Pool::builder().build(manager).await.unwrap());
 
-    create_messages_table(&conn_pool).await?;
-    insert_test_messages(&conn_pool, 20).await?;
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    let (client, mut connection) = listen_config.connect(NoTls).await.unwrap();
+
+    let stream = stream::poll_fn(move |context| connection.poll_message(context))
+        .map_err(|e| panic!("{}", e));
+    let listen_connection = stream.forward(sender).map(|r| r.unwrap());
+    tokio::spawn(listen_connection);
+
+    client.execute("LISTEN new_task", &[]).await.unwrap();
+
+    let pool_clone = conn_pool.clone();
+    tokio::spawn(async {
+        time::sleep(Duration::from_secs(5)).await;
+        create_messages_table(pool_clone).await.unwrap();
+    });
+
+    let pool_clone = conn_pool.clone();
+    tokio::spawn(async {
+        time::sleep(Duration::from_secs(5)).await;
+        insert_test_messages(pool_clone, 20).await.unwrap();
+    });
 
     let tracker = TaskTracker::new();
 
@@ -48,9 +75,8 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     let cloned_token = token.clone();
     let main_tracker = tracker.clone();
-    let worker_count = 5;
     let pool = conn_pool.clone();
-    let handle = handle_messages(worker_count, pool.clone(), main_tracker, cloned_token).await;
+    let handle = handle_messages(pool.clone(), main_tracker, cloned_token, receiver).await;
 
     handle.await.unwrap();
 
@@ -99,10 +125,10 @@ async fn handle_messages(
 
 #[cfg(windows)]
 async fn handle_messages(
-    worker_count: u32,
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
+    mut receiver: UnboundedReceiver<tokio_postgres::AsyncMessage>,
 ) -> JoinHandle<()> {
     use tokio::signal::windows;
 
@@ -110,11 +136,24 @@ async fn handle_messages(
     let mut signal_break = windows::ctrl_break().unwrap();
     let mut signal_close = windows::ctrl_close().unwrap();
     let mut signal_shutdown = windows::ctrl_shutdown().unwrap();
+
     tokio::spawn(async move {
         loop {
-            let tracker_handle = main_tracker.clone();
             let signal_tracker_handle = main_tracker.clone();
             tokio::select! {
+                message = receiver.next() => {
+                    match message {
+                        Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
+                            let worker_pool_handle = pool.clone();
+                            main_tracker.spawn(async move {
+                                let client = worker_pool_handle.get().await.unwrap();
+                                let _ = worker_run(client).await;
+                            });
+                        },
+                        Some(n) => info!("{:?}", n),
+                        _ => info!("No notification sent."),
+                    };
+                },
                 _ = signal_c.recv() => {
                     cancellation_token.cancel();
                     signal_tracker_handle.close();
@@ -135,8 +174,7 @@ async fn handle_messages(
                     signal_tracker_handle.close();
                     break;
                 },
-                _ = launch_workers(worker_count, pool.clone(), tracker_handle) => {},
-            };
+            }
         }
     })
 }
@@ -219,7 +257,7 @@ async fn process_message(
 }
 
 async fn create_messages_table(
-    pool: &Pool<PostgresConnectionManager<NoTls>>,
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
 ) -> Result<(), tokio_postgres::Error> {
     let client = pool.get().await.unwrap();
 
@@ -243,7 +281,20 @@ async fn create_messages_table(
                 payload JSONB,
                 status job_status NOT NULL DEFAULT 'pending',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );",
+            );
+
+            CREATE OR REPLACE FUNCTION new_job_trigger_fn() RETURNS trigger AS $$
+            BEGIN
+              PERFORM pg_notify('new_task', NEW.id::text);
+              RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            CREATE TRIGGER new_task_trigger
+            AFTER INSERT ON messages
+            FOR EACH ROW
+            EXECUTE FUNCTION new_job_trigger_fn();
+            ",
         )
         .await?;
 
@@ -251,41 +302,49 @@ async fn create_messages_table(
 }
 
 async fn insert_test_messages(
-    pool: &Pool<PostgresConnectionManager<NoTls>>,
+    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     count: usize,
 ) -> Result<(), tokio_postgres::Error> {
     let client = pool.get().await.unwrap();
-    let mut rng = rand::rng();
+    loop {
+        let payloads = {
+            let mut rng = rand::rng();
 
-    let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
-    let actions = ["create", "update", "delete", "process", "sync"];
-    let entities = ["user", "product", "order", "invoice", "subscription"];
+            let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
+            let actions = ["create", "update", "delete", "process", "sync"];
+            let entities = ["user", "product", "order", "invoice", "subscription"];
 
-    for _ in 0..count {
-        let queue_name = queue_names[rng.random_range(0..queue_names.len())];
-        let action = actions[rng.random_range(0..actions.len())];
-        let entity = entities[rng.random_range(0..entities.len())];
+            let mut payloads = Vec::new();
+            for _ in 0..count {
+                let queue_name = queue_names[rng.random_range(0..queue_names.len())];
+                let action = actions[rng.random_range(0..actions.len())];
+                let entity = entities[rng.random_range(0..entities.len())];
 
-        let payload = json!({
-            "action": action,
-            "entity": entity,
-            "entity_id": rng.random_range(1000..9999),
-            "amount": rng.random_range(10.0..1000.0_f64),
-            "priority": rng.random_range(1..5),
-            "metadata": {
-                "source": format!("system_{}", rng.random_range(1..10)),
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "retry_count": 0
+                let payload = json!({
+                    "action": action,
+                    "entity": entity,
+                    "entity_id": rng.random_range(1000..9999),
+                    "amount": rng.random_range(10.0..1000.0_f64),
+                    "priority": rng.random_range(1..5),
+                    "metadata": {
+                        "source": format!("system_{}", rng.random_range(1..10)),
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "retry_count": 0
+                    }
+                });
+                payloads.push((queue_name, payload));
             }
-        });
+            payloads
+        };
 
-        client
-            .execute(
-                "INSERT INTO messages (queue_name, payload, status) VALUES ($1, $2, $3)",
-                &[&queue_name, &payload, &JobStatus::Pending],
-            )
-            .await?;
+        for (queue_name, payload) in payloads {
+            client
+                .execute(
+                    "INSERT INTO messages (queue_name, payload, status) VALUES ($1, $2, $3)",
+                    &[&queue_name, &payload, &JobStatus::Pending],
+                )
+                .await?;
+        }
+        sleep(Duration::from_secs(30)).await;
     }
-
-    Ok(())
 }
