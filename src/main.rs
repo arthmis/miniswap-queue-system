@@ -63,17 +63,17 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     client.execute("LISTEN new_task", &[]).await.unwrap();
 
-    let pool_clone = conn_pool.clone();
-    tokio::spawn(async {
-        time::sleep(Duration::from_secs(5)).await;
-        create_messages_table(pool_clone).await.unwrap();
-    });
+    // let pool_clone = conn_pool.clone();
+    // tokio::spawn(async {
+    //     time::sleep(Duration::from_secs(5)).await;
+    //     create_messages_table(pool_clone).await.unwrap();
+    // });
 
-    let pool_clone = conn_pool.clone();
-    tokio::spawn(async {
-        time::sleep(Duration::from_secs(5)).await;
-        insert_test_messages(pool_clone, 20).await.unwrap();
-    });
+    // let pool_clone = conn_pool.clone();
+    // tokio::spawn(async {
+    //     time::sleep(Duration::from_secs(5)).await;
+    //     insert_test_messages(pool_clone, 20).await.unwrap();
+    // });
 
     let tracker = TaskTracker::new();
 
@@ -256,14 +256,16 @@ async fn schedule_stuck_jobs(
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     task_tracker: TaskTracker,
 ) -> Result<(), WorkerError> {
+    info!("scheduling {} tasks for stuck jobs", task_count);
+
     async fn handle_stuck_job(
         cloned_pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     ) -> Result<(), WorkerError> {
         let mut connection = cloned_pool.get().await.unwrap();
         let statement = "WITH task AS (
         SELECT * FROM messages
-        WHERE status = 'in_progress'
-        AND started_at < NOW() - INTERVAL '5 minutes'
+        WHERE (status = 'in_progress' AND last_started_at < NOW() - INTERVAL '5 minutes')
+        OR (status = 'pending' AND last_started_at < NOW() - INTERVAL '5 minutes')
         ORDER BY priority ASC
         FOR UPDATE SKIP LOCKED LIMIT 1
         )
