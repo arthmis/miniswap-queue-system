@@ -176,21 +176,25 @@ async fn handle_messages(
                 };
             },
             _ = signal_c.recv() => {
+                info!("received ctrl c signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
             },
             _ = signal_break.recv() => {
+                info!("received ctrl break signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
             },
             _ = signal_close.recv() => {
+                info!("received ctrl close signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
             },
             _ = signal_shutdown.recv() => {
+                info!("received ctrl shutdown signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
@@ -220,21 +224,25 @@ async fn handle_failed_and_stuck_messages(
                 time::sleep(Duration::from_mins(1)).await;
             },
             _ = signal_c.recv() => {
+                info!("received ctrl c signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
             },
             _ = signal_break.recv() => {
+                info!("received ctrl break signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
             },
             _ = signal_close.recv() => {
+                info!("received ctrl close signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
             },
             _ = signal_shutdown.recv() => {
+                info!("received ctrl shutdown signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
                 break;
@@ -370,7 +378,7 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
 }
 
 async fn process_task(id: i32, payload: &serde_json::Value) -> Result<(), MessageProcessingError> {
-    println!("task: {id}\npayload: {:?}\n", payload);
+    info!("task: {id}\npayload: {:?}\n", payload);
 
     // this is just to have a simulated processing time
     // rng needs to be dropped before await, can't be held across an await point
