@@ -2,18 +2,15 @@ use std::sync::Arc;
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use std::time::Duration;
 use tokio_postgres::NoTls;
-#[cfg(windows)]
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::{
-    errors::WorkerError,
-    message::MessagePayload,
-    process_task,
-    retry::{RetryStrategy, retry},
-};
+use tokio::time;
+
+use crate::{errors::WorkerError, worker_run};
 
 #[cfg(windows)]
 pub async fn handle_scheduled_tasks(
@@ -30,38 +27,37 @@ pub async fn handle_scheduled_tasks(
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl shutdown to be available");
 
     loop {
-        use std::time::Duration;
-
-        use tokio::time;
-
         let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
-            _ = schedule_tasks(task_count, pool.clone(), main_tracker.clone()) => {
-                time::sleep(Duration::from_secs(20)).await;
+            biased;
+            _ = cancellation_token.cancelled() => {
+                info!("scheduled tasks received task cancelled");
+                break;
             },
             _ = signal_c.recv() => {
                 info!("received ctrl c signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
             },
             _ = signal_break.recv() => {
                 info!("received ctrl break signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
             },
             _ = signal_close.recv() => {
                 info!("received ctrl close signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
             },
             _ = signal_shutdown.recv() => {
                 info!("received ctrl shutdown signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
+            },
+            _ = schedule_tasks(task_count, pool.clone(), cancellation_token.clone()) => {
+                let sleep_length = Duration::from_secs(30);
+                info!("All scheduled tasks complete, sleeping for {:?}", sleep_length);
+                time::sleep(sleep_length).await;
             },
         }
     }
@@ -70,84 +66,84 @@ pub async fn handle_scheduled_tasks(
 async fn schedule_tasks(
     task_count: u32,
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
-    task_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
 ) -> Result<(), WorkerError> {
-    info!("scheduling {} tasks for scheduled jobs", task_count);
+    let statement = "WITH task AS (
+    SELECT * FROM messages
+    WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()
+    ORDER BY priority ASC
+    FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    UPDATE messages SET status = 'in_progress',
+    last_started_at = NOW()
+    FROM task
+    WHERE messages.id = task.id RETURNING task.*";
 
-    async fn handle_job(
-        cloned_pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
-    ) -> Result<(), WorkerError> {
-        let mut connection = cloned_pool.get().await.unwrap();
-        let statement = "WITH task AS (
-        SELECT * FROM messages
-        WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()
-        ORDER BY priority ASC
-        FOR UPDATE SKIP LOCKED LIMIT 1
-        )
-        UPDATE messages SET status = 'in_progress',
-        last_started_at = NOW()
-        FROM task
-        WHERE messages.id = task.id RETURNING task.*";
-        let transaction = connection.transaction().await?;
-        let result = transaction.query_opt(statement, &[]).await;
+    let count_statement = "SELECT COUNT(*) FROM messages
+        WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()";
 
-        let Ok(Some(row)) = result else {
+    loop {
+        // Check for cancellation at the start of each iteration
+        if cancellation_token.is_cancelled() {
+            info!("Cancellation requested, exiting schedule_tasks");
             return Ok(());
-        };
-
-        let message = MessagePayload::try_from(row)?;
-        let message_result = retry(
-            RetryStrategy::ExponentialBackoff {
-                max_attempts: 5,
-                duration: tokio::time::Duration::from_millis(1000),
-            },
-            || process_task(message.id(), message.payload()),
-        )
-        .await;
-        if let Err(err) = message_result {
-            error!(
-                "Error processing message for message id: {}\nerror: {:?}",
-                message.id(),
-                err
-            );
-            return Err(err.into());
         }
 
-        let status_update_result = transaction
-            .execute(
-                "UPDATE messages SET status = 'completed' WHERE id = $1",
-                &[&message.id()],
-            )
-            .await;
-        let updated_row_count = match status_update_result {
-            Ok(updated_row_count) => updated_row_count,
-            Err(err) => {
-                error!(
-                    "Error updating status of task with id: {}\nerror: {:?}",
-                    message.id(),
-                    err
-                );
-                return Err(err.into());
+        let pending_scheduled_tasks_count = {
+            let connection = match pool.get().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    error!("Failed to get connection from pool: {:?}", err);
+                    return Err(WorkerError::PoolError(err));
+                }
+            };
+
+            let pending_count: i64 = match connection.query_one(count_statement, &[]).await {
+                Ok(row) => row.get(0),
+                Err(err) => {
+                    error!("Failed to query pending scheduled task count: {:?}", err);
+                    return Err(err.into());
+                }
+            };
+            pending_count
+        };
+
+        if pending_scheduled_tasks_count == 0 {
+            info!("No pending scheduled tasks found");
+            break;
+        }
+
+        info!(
+            "Found {} pending scheduled tasks, scheduling batch of {} workers",
+            pending_scheduled_tasks_count, task_count
+        );
+
+        let batch_tracker = TaskTracker::new();
+
+        // if pending tasks are less than given task count only spin up what's necessary
+        // to avoid querying the database more than necessary
+        let task_count = task_count.min(pending_scheduled_tasks_count as u32);
+
+        for _ in 0..task_count {
+            let cloned_pool = pool.clone();
+            batch_tracker.spawn(worker_run(cloned_pool, statement));
+        }
+
+        batch_tracker.close();
+
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                info!("Cancellation requested during batch execution, waiting for current batch to complete");
+                batch_tracker.wait().await;
+                info!("Batch completed after cancellation, exiting schedule_tasks");
+                return Ok(());
             }
-        };
-        assert_eq!(updated_row_count, 1);
-
-        if let Err(err) = transaction.commit().await {
-            error!(
-                "Error completing transaction for task with id: {}\nerror: {:?}",
-                message.id(),
-                err
-            );
-            return Err(err.into());
+            _ = batch_tracker.wait() => {
+                warn!("Batch complete, checking for remaining scheduled tasks");
+            }
         }
-
-        info!("Task completed - id: {}", message.id());
-        Ok(())
     }
 
-    for _ in 0..task_count {
-        let cloned_pool = pool.clone();
-        task_tracker.spawn(handle_job(cloned_pool));
-    }
     Ok(())
 }

@@ -1,16 +1,15 @@
-#[cfg(windows)]
 use std::sync::Arc;
 
-#[cfg(windows)]
 use bb8::Pool;
-#[cfg(windows)]
 use bb8_postgres::PostgresConnectionManager;
-#[cfg(windows)]
 use futures::channel::mpsc::UnboundedReceiver;
-#[cfg(windows)]
 use tokio_postgres::NoTls;
-#[cfg(windows)]
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+use tokio_stream::StreamExt;
+use tracing::{debug, info};
+
+use crate::worker_run;
 
 #[cfg(windows)]
 pub async fn handle_messages(
@@ -27,66 +26,54 @@ pub async fn handle_messages(
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl_shutdown to be available");
 
     loop {
-        use std::time::Duration;
-
-        use tokio_stream::StreamExt;
-        use tracing::{debug, error, info};
-
-        use crate::{
-            retry::{RetryStrategy, retry},
-            worker_run,
-        };
-
         let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
-            message = receiver.next() => {
-                match message {
-                    Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
-                        let worker_pool_handle = pool.clone();
-                        main_tracker.spawn(async move {
-                            let client = retry(
-                                RetryStrategy::ExponentialBackoff {
-                                    max_attempts: 3,
-                                    duration: Duration::from_millis(50)
-                                },
-                                || worker_pool_handle.get()
-                            ).await;
-                            match client {
-                                Ok(client) => {
-                                    let _ = worker_run(client).await;
-                                },
-                                Err(err) => error!("Couldn't get a connection to pool within 3 retries:\n{:?}", err),
-                            };
-
-                        });
-                    },
-                    Some(n) => debug!("{:?}", n),
-                    _ => info!("No notification sent."),
-                };
+            biased;
+            _ = cancellation_token.cancelled() => {
+                info!("real time tasks received task cancelled");
+                break;
             },
             _ = signal_c.recv() => {
                 info!("received ctrl c signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
             },
             _ = signal_break.recv() => {
                 info!("received ctrl break signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
             },
             _ = signal_close.recv() => {
                 info!("received ctrl close signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
             },
             _ = signal_shutdown.recv() => {
                 info!("received ctrl shutdown signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
-                break;
+            },
+            message = receiver.next() => {
+                match message {
+                    Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
+                        let worker_pool_handle = pool.clone();
+                        main_tracker.spawn(async move {
+                            let statement = "WITH task AS (
+                                SELECT * FROM messages
+                                WHERE status = 'pending' AND scheduled_at IS NULL
+                                ORDER BY priority ASC, created_at DESC
+                                FOR UPDATE SKIP LOCKED LIMIT 1
+                                )
+                                UPDATE messages SET status = 'in_progress',
+                                last_started_at = NOW()
+                                FROM task
+                                WHERE messages.id = task.id RETURNING task.*";
+                            let _ = worker_run(worker_pool_handle.clone(), statement).await;
+                        });
+                    },
+                    Some(n) => debug!("{:?}", n),
+                    _ => info!("No notification sent."),
+                };
             },
         }
     }

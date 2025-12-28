@@ -25,6 +25,7 @@ impl std::error::Error for MessageProcessingError {
 pub enum WorkerError {
     Database(tokio_postgres::Error),
     MessageProcessing(MessageProcessingError),
+    PoolError(bb8::RunError<tokio_postgres::Error>),
 }
 
 impl Display for WorkerError {
@@ -32,6 +33,7 @@ impl Display for WorkerError {
         let val = match self {
             WorkerError::Database(error) => error.to_string(),
             WorkerError::MessageProcessing(error) => error.to_string(),
+            WorkerError::PoolError(error) => error.to_string(),
         };
 
         f.write_str(&val)
@@ -43,6 +45,7 @@ impl std::error::Error for WorkerError {
         match self {
             WorkerError::Database(error) => error.source(),
             WorkerError::MessageProcessing(error) => error.source(),
+            WorkerError::PoolError(error) => error.source(),
         }
     }
 }
@@ -56,5 +59,11 @@ impl From<tokio_postgres::Error> for WorkerError {
 impl From<MessageProcessingError> for WorkerError {
     fn from(value: MessageProcessingError) -> Self {
         WorkerError::MessageProcessing(value)
+    }
+}
+
+impl From<bb8::RunError<tokio_postgres::Error>> for WorkerError {
+    fn from(value: bb8::RunError<tokio_postgres::Error>) -> Self {
+        WorkerError::PoolError(value)
     }
 }

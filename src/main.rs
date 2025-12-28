@@ -9,7 +9,7 @@ mod simulated_data_generation;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bb8::{Pool, PooledConnection};
+use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::Rng;
@@ -67,8 +67,8 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     client.execute("LISTEN new_task", &[]).await.unwrap();
 
-    let pool_clone = conn_pool.clone();
-    create_messages_table(pool_clone).await.unwrap();
+    // let pool_clone = conn_pool.clone();
+    // create_messages_table(pool_clone).await.unwrap();
 
     let pool_clone = conn_pool.clone();
     tokio::spawn(async {
@@ -111,19 +111,25 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     Ok(())
 }
 
-type PoolConnection<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
-
-async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
-    let statement = "WITH task AS (
-        SELECT * FROM messages
-        WHERE status = 'pending' AND scheduled_at IS NULL
-        ORDER BY priority ASC, created_at DESC
-        FOR UPDATE SKIP LOCKED LIMIT 1
-        )
-        UPDATE messages SET status = 'in_progress',
-        last_started_at = NOW()
-        FROM task
-        WHERE messages.id = task.id RETURNING task.*";
+pub async fn worker_run(
+    cloned_pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    statement: &'static str,
+) -> Result<(), WorkerError> {
+    let client = retry(
+        RetryStrategy::ExponentialBackoff {
+            max_attempts: 3,
+            duration: Duration::from_millis(50),
+        },
+        || cloned_pool.get(),
+    )
+    .await;
+    let mut connection = match client {
+        Ok(client) => client,
+        Err(err) => {
+            error!("error getting client connection to database: {:?}", err);
+            return Err(err.into());
+        }
+    };
     let transaction = connection.transaction().await?;
     let result = transaction.query_opt(statement, &[]).await;
 
@@ -141,12 +147,24 @@ async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerErro
     )
     .await?;
 
-    transaction
+    let status_update_result = transaction
         .execute(
             "UPDATE messages SET status = 'completed' WHERE id = $1",
             &[&message.id()],
         )
-        .await?;
+        .await;
+    let updated_row_count = match status_update_result {
+        Ok(updated_row_count) => updated_row_count,
+        Err(err) => {
+            error!(
+                "Error updating status of task with id: {}\nerror: {:?}",
+                message.id(),
+                err
+            );
+            return Err(err.into());
+        }
+    };
+    assert_eq!(updated_row_count, 1);
 
     transaction.commit().await?;
     debug!("Task completed - id: {}", message.id());
