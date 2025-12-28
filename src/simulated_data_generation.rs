@@ -1,7 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration as StdDuration};
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use chrono::{Duration, Utc};
 use rand::Rng;
 use serde_json::json;
 use tokio::time::sleep;
@@ -89,19 +90,28 @@ pub async fn insert_test_messages(
                         "retry_count": 0
                     }
                 });
-                payloads.push((queue_name, payload, priority));
+                // Randomly decide if this task should be scheduled (50% chance)
+                let scheduled_at = if rng.random_bool(0.5) {
+                    // Generate scheduled_at time: 0 to 2 minutes ahead
+                    let scheduled_seconds_ahead = rng.random_range(0..=120);
+                    Some(Utc::now() + Duration::seconds(scheduled_seconds_ahead))
+                } else {
+                    None
+                };
+
+                payloads.push((queue_name, payload, priority, scheduled_at));
             }
             payloads
         };
 
-        for (queue_name, payload, priority) in payloads {
+        for (queue_name, payload, priority, scheduled_at) in payloads {
             client
                 .execute(
-                    "INSERT INTO messages (queue_name, payload, priority, status) VALUES ($1, $2, $3, $4)",
-                    &[&queue_name, &payload, &priority, &JobStatus::Pending],
+                    "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
+                    &[&queue_name, &payload, &priority, &JobStatus::Pending, &scheduled_at],
                 )
                 .await?;
         }
-        sleep(Duration::from_secs(30)).await;
+        sleep(StdDuration::from_secs(5)).await;
     }
 }

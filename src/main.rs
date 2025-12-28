@@ -3,14 +3,17 @@ mod errors;
 mod message;
 mod real_time_tasks;
 mod retry;
+mod scheduled_tasks;
 mod simulated_data_generation;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bb8::{Pool, PooledConnection};
 use bb8_postgres::PostgresConnectionManager;
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::Rng;
+use tokio::time;
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Level;
@@ -18,6 +21,8 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 
+use crate::simulated_data_generation::create_messages_table;
+use crate::simulated_data_generation::insert_test_messages;
 use crate::{
     errors::{MessageProcessingError, WorkerError},
     message::MessagePayload,
@@ -62,17 +67,13 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     client.execute("LISTEN new_task", &[]).await.unwrap();
 
-    // let pool_clone = conn_pool.clone();
-    // tokio::spawn(async {
-    //     time::sleep(Duration::from_secs(5)).await;
-    //     create_messages_table(pool_clone).await.unwrap();
-    // });
+    let pool_clone = conn_pool.clone();
+    create_messages_table(pool_clone).await.unwrap();
 
-    // let pool_clone = conn_pool.clone();
-    // tokio::spawn(async {
-    //     time::sleep(Duration::from_secs(5)).await;
-    //     insert_test_messages(pool_clone, 20).await.unwrap();
-    // });
+    let pool_clone = conn_pool.clone();
+    tokio::spawn(async {
+        insert_test_messages(pool_clone, 5).await.unwrap();
+    });
 
     let tracker = TaskTracker::new();
 
@@ -93,8 +94,14 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         clean_up_stuck_tasks::handle_failed_and_stuck_messages(
             task_count,
             pool.clone(),
-            main_tracker,
-            cloned_token
+            main_tracker.clone(),
+            cloned_token.clone(),
+        ),
+        scheduled_tasks::handle_scheduled_tasks(
+            task_count,
+            pool.clone(),
+            main_tracker.clone(),
+            cloned_token.clone()
         )
     );
 
@@ -109,7 +116,7 @@ type PoolConnection<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>
 async fn worker_run(mut connection: PoolConnection<'_>) -> Result<(), WorkerError> {
     let statement = "WITH task AS (
         SELECT * FROM messages
-        WHERE status = 'pending'
+        WHERE status = 'pending' AND scheduled_at IS NULL
         ORDER BY priority ASC, created_at DESC
         FOR UPDATE SKIP LOCKED LIMIT 1
         )
