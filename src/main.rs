@@ -79,7 +79,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     let token = CancellationToken::new();
 
-    let task_count: u32 = 6;
+    let task_count: u32 = 10;
 
     let cloned_token = token.clone();
     let main_tracker = tracker.clone();

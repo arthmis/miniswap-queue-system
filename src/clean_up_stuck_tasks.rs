@@ -62,7 +62,7 @@ pub async fn handle_failed_and_stuck_messages(
     }
 }
 
-pub async fn schedule_stuck_jobs(
+async fn schedule_stuck_jobs(
     task_count: u32,
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     task_tracker: TaskTracker,

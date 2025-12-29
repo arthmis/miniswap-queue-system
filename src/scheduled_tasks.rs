@@ -8,9 +8,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-use tokio::time;
-
 use crate::{errors::WorkerError, worker_run};
+use tokio::time;
 
 #[cfg(windows)]
 pub async fn handle_scheduled_tasks(
@@ -57,15 +56,12 @@ pub async fn handle_scheduled_tasks(
                 signal_tracker_handle.close();
             },
             result = schedule_tasks(task_count, pool.clone(), batch_tracker.clone(), cancellation_token.clone()) => {
-                let (batch, ready_scheduled_tasks_count) = result.unwrap();
-                batch.wait().await;
-                // this runs if the batch is empty which is always the case if I wait till the tasks finish
-                // need to a way to decide that I should keep looping until
-                // probably need to return the pending count or something like that
+                let ready_scheduled_tasks_count = result.unwrap();
+                batch_tracker.wait().await;
                 if let None = ready_scheduled_tasks_count {
                     let sleep_length = Duration::from_secs(10);
                     warn!("All scheduled tasks complete, sleeping for {:?}", sleep_length);
-                    // time::sleep(sleep_length).await;
+                    time::sleep(sleep_length).await;
                 }
             },
         }
@@ -77,7 +73,7 @@ async fn schedule_tasks(
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     batch_tracker: TaskTracker,
     cancellation_token: CancellationToken,
-) -> Result<(TaskTracker, Option<u32>), WorkerError> {
+) -> Result<Option<u32>, WorkerError> {
     let statement = "WITH task AS (
     SELECT * FROM messages
     WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()
@@ -91,13 +87,6 @@ async fn schedule_tasks(
 
     let count_statement = "SELECT COUNT(*) FROM messages
         WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()";
-
-    // loop {
-    // Check for cancellation at the start of each iteration
-    if cancellation_token.is_cancelled() {
-        warn!("Cancellation requested, exiting schedule_tasks");
-        return Ok((batch_tracker, None));
-    }
 
     let pending_scheduled_tasks_count = {
         let connection = match pool.get().await {
@@ -120,7 +109,7 @@ async fn schedule_tasks(
 
     if pending_scheduled_tasks_count == 0 {
         warn!("No pending scheduled tasks found");
-        return Ok((batch_tracker, None));
+        return Ok(None);
     }
 
     warn!(
@@ -145,13 +134,12 @@ async fn schedule_tasks(
             warn!("Cancellation requested during batch execution, waiting for current batch to complete");
             batch_tracker.wait().await;
             warn!("Batch completed after cancellation, exiting schedule_tasks");
-            return Ok((batch_tracker, None));
+            return Ok( None);
         }
         _ = batch_tracker.wait() => {
             warn!("Batch complete, checking for remaining scheduled tasks");
         }
     }
-    // }
 
-    Ok((batch_tracker, Some(pending_scheduled_tasks_count as u32)))
+    Ok(Some(pending_scheduled_tasks_count as u32))
 }
