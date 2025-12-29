@@ -10,47 +10,8 @@ use crate::{
     retry::{RetryStrategy, retry},
 };
 
-#[derive(Debug)]
-pub enum QueueError {
-    Database(tokio_postgres::Error),
-    Pool(bb8::RunError<tokio_postgres::Error>),
-    PayloadConversion(String),
-}
-
-impl std::fmt::Display for QueueError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            QueueError::Database(err) => write!(f, "Database error: {}", err),
-            QueueError::Pool(err) => write!(f, "Connection pool error: {}", err),
-            QueueError::PayloadConversion(err) => write!(f, "Payload conversion error: {}", err),
-        }
-    }
-}
-
-impl std::error::Error for QueueError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            QueueError::Database(err) => Some(err),
-            QueueError::Pool(err) => Some(err),
-            QueueError::PayloadConversion(_) => None,
-        }
-    }
-}
-
-impl From<tokio_postgres::Error> for QueueError {
-    fn from(err: tokio_postgres::Error) -> Self {
-        QueueError::Database(err)
-    }
-}
-
-impl From<bb8::RunError<tokio_postgres::Error>> for QueueError {
-    fn from(err: bb8::RunError<tokio_postgres::Error>) -> Self {
-        QueueError::Pool(err)
-    }
-}
-
 pub trait Queue {
-    type QueueError: std::error::Error;
+    type QueueError: std::error::Error + Send;
 
     /// Get the newest pending task that doesn't have a scheduled time
     fn get_newest_pending_task(
@@ -69,6 +30,10 @@ pub trait Queue {
         &self,
         task_id: i32,
     ) -> impl Future<Output = Result<(), Self::QueueError>> + Send;
+    /// Get count of scheduled tasks that are due
+    fn pending_scheduled_tasks_count(
+        &self,
+    ) -> impl Future<Output = Result<i64, Self::QueueError>> + Send;
 }
 
 #[derive(Clone)]
@@ -85,7 +50,7 @@ impl PostgresQueue {
 
     async fn get_connection(
         &self,
-    ) -> Result<PooledConnection<'_, PostgresConnectionManager<NoTls>>, QueueError> {
+    ) -> Result<PooledConnection<'_, PostgresConnectionManager<NoTls>>, PostgresQueueError> {
         let client = retry(
             RetryStrategy::ExponentialBackoff {
                 max_attempts: 3,
@@ -96,14 +61,14 @@ impl PostgresQueue {
         .await;
         let connection = client.map_err(|err| {
             error!("error getting client connection to database: {:?}", err);
-            QueueError::Pool(err)
+            PostgresQueueError::Pool(err)
         })?;
         Ok(connection)
     }
 }
 
 impl Queue for PostgresQueue {
-    type QueueError = QueueError;
+    type QueueError = PostgresQueueError;
 
     async fn get_newest_pending_task(&self) -> Result<Option<TaskPayload>, Self::QueueError> {
         let statement = "WITH task AS (
@@ -127,7 +92,7 @@ impl Queue for PostgresQueue {
         .await;
         let mut connection = client.map_err(|err| {
             error!("error getting client connection to database: {:?}", err);
-            QueueError::Pool(err)
+            PostgresQueueError::Pool(err)
         })?;
 
         let transaction = connection.transaction().await?;
@@ -138,7 +103,7 @@ impl Queue for PostgresQueue {
         };
 
         let payload = TaskPayload::try_from(row)
-            .map_err(|e| QueueError::PayloadConversion(format!("{:?}", e)))?;
+            .map_err(|e| PostgresQueueError::PayloadConversion(format!("{:?}", e)))?;
 
         transaction.commit().await?;
 
@@ -167,7 +132,7 @@ impl Queue for PostgresQueue {
         };
 
         let payload = TaskPayload::try_from(row)
-            .map_err(|e| QueueError::PayloadConversion(format!("{:?}", e)))?;
+            .map_err(|e| PostgresQueueError::PayloadConversion(format!("{:?}", e)))?;
 
         transaction.commit().await?;
 
@@ -195,7 +160,7 @@ impl Queue for PostgresQueue {
         };
 
         let payload = TaskPayload::try_from(row)
-            .map_err(|e| QueueError::PayloadConversion(format!("{:?}", e)))?;
+            .map_err(|e| PostgresQueueError::PayloadConversion(format!("{:?}", e)))?;
 
         transaction.commit().await?;
 
@@ -211,5 +176,60 @@ impl Queue for PostgresQueue {
 
         transaction.commit().await?;
         Ok(())
+    }
+
+    async fn pending_scheduled_tasks_count(&self) -> Result<i64, Self::QueueError> {
+        let statement = "SELECT COUNT(*) FROM messages
+            WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()";
+
+        let connection = self.get_connection().await?;
+        let row = connection.query_one(statement, &[]).await.map_err(|err| {
+            error!("Failed to query pending scheduled task count: {:?}", err);
+            return err;
+        })?;
+
+        let pending_count = row.get(0);
+        Ok(pending_count)
+    }
+}
+
+#[derive(Debug)]
+pub enum PostgresQueueError {
+    Database(tokio_postgres::Error),
+    Pool(bb8::RunError<tokio_postgres::Error>),
+    PayloadConversion(String),
+}
+
+impl std::fmt::Display for PostgresQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PostgresQueueError::Database(err) => write!(f, "Database error: {}", err),
+            PostgresQueueError::Pool(err) => write!(f, "Connection pool error: {}", err),
+            PostgresQueueError::PayloadConversion(err) => {
+                write!(f, "Payload conversion error: {}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PostgresQueueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PostgresQueueError::Database(err) => Some(err),
+            PostgresQueueError::Pool(err) => Some(err),
+            PostgresQueueError::PayloadConversion(_) => None,
+        }
+    }
+}
+
+impl From<tokio_postgres::Error> for PostgresQueueError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        PostgresQueueError::Database(err)
+    }
+}
+
+impl From<bb8::RunError<tokio_postgres::Error>> for PostgresQueueError {
+    fn from(err: bb8::RunError<tokio_postgres::Error>) -> Self {
+        PostgresQueueError::Pool(err)
     }
 }

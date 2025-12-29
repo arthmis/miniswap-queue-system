@@ -1,23 +1,23 @@
-use std::sync::Arc;
-
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
 use std::time::Duration;
-use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-use crate::{errors::WorkerError, worker_run};
+#[cfg(windows)]
+use crate::db::Queue;
+use crate::{db::PostgresQueueError, worker_run};
 use tokio::time;
 
 #[cfg(windows)]
-pub async fn handle_scheduled_tasks(
+pub async fn handle_scheduled_tasks<T>(
     task_count: u32,
-    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    pool: T,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
-) {
+) where
+    T: Queue + Clone + Send + 'static,
+    PostgresQueueError: From<<T as Queue>::QueueError>,
+{
     use tokio::signal::windows;
 
     let mut signal_c = windows::ctrl_c().expect("ctrl c to be available");
@@ -68,51 +68,24 @@ pub async fn handle_scheduled_tasks(
     }
 }
 
-async fn schedule_tasks(
+async fn schedule_tasks<T>(
     task_count: u32,
-    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    queue: T,
     batch_tracker: TaskTracker,
     cancellation_token: CancellationToken,
-) -> Result<Option<u32>, WorkerError> {
-    let statement = "WITH task AS (
-    SELECT * FROM messages
-    WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()
-    ORDER BY priority ASC
-    FOR UPDATE SKIP LOCKED LIMIT 1
-    )
-    UPDATE messages SET status = 'in_progress',
-    last_started_at = NOW()
-    FROM task
-    WHERE messages.id = task.id RETURNING task.*";
-
-    let count_statement = "SELECT COUNT(*) FROM messages
-        WHERE scheduled_at IS NOT NULL AND status = 'pending' AND scheduled_at <= NOW()";
-
-    let pending_scheduled_tasks_count = {
-        let connection = match pool.get().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                error!("Failed to get connection from pool: {:?}", err);
-                return Err(WorkerError::PoolError(err));
-            }
-        };
-
-        let pending_count: i64 = match connection.query_one(count_statement, &[]).await {
-            Ok(row) => row.get(0),
-            Err(err) => {
-                error!("Failed to query pending scheduled task count: {:?}", err);
-                return Err(err.into());
-            }
-        };
-        pending_count
-    };
+) -> Result<Option<u32>, PostgresQueueError>
+where
+    T: Queue + Clone + Send + 'static,
+    PostgresQueueError: From<<T as Queue>::QueueError>,
+{
+    let pending_scheduled_tasks_count = queue.pending_scheduled_tasks_count().await?;
 
     if pending_scheduled_tasks_count == 0 {
-        warn!("No pending scheduled tasks found");
+        info!("No pending scheduled tasks found");
         return Ok(None);
     }
 
-    warn!(
+    info!(
         "Found {} pending scheduled tasks, scheduling batch of {} workers",
         pending_scheduled_tasks_count, task_count
     );
@@ -122,8 +95,24 @@ async fn schedule_tasks(
     let task_count = task_count.min(pending_scheduled_tasks_count as u32);
 
     for _ in 0..task_count {
-        let cloned_pool = pool.clone();
-        batch_tracker.spawn(worker_run(cloned_pool, statement));
+        let worker_queue = queue.clone();
+        batch_tracker.spawn(async move {
+            if let Ok(Some(task)) = worker_queue.get_scheduled_task().await {
+                let task_id = task.id();
+                if let Err(err) = worker_run(task).await {
+                    error!(
+                        "Error processing scheduled task with id: {}\nerror: {:?}",
+                        task_id, err
+                    );
+                };
+                if let Err(err) = worker_queue.update_task_status_to_complete(task_id).await {
+                    error!(
+                        "Error updating scheduled task status for task with id: {}\nerror: {:?}",
+                        task_id, err
+                    );
+                };
+            }
+        });
     }
 
     batch_tracker.close();

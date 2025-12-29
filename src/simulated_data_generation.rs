@@ -8,7 +8,7 @@ use serde_json::json;
 use tokio::time::sleep;
 use tokio_postgres::NoTls;
 
-use crate::message::JobStatus;
+use crate::message::TaskStatus;
 
 pub async fn create_messages_table(
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
@@ -108,7 +108,7 @@ pub async fn insert_test_messages(
             client
                 .execute(
                     "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
-                    &[&queue_name, &payload, &priority, &JobStatus::Pending, &scheduled_at],
+                    &[&queue_name, &payload, &priority, &TaskStatus::Pending, &scheduled_at],
                 )
                 .await?;
         }

@@ -1,18 +1,17 @@
-use std::sync::Arc;
-
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
-use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::info;
+use tracing::{error, info};
 
-use crate::{errors::WorkerError, worker_run};
+use crate::db::Queue;
+use crate::worker_run;
+use std::time::Duration;
+
+use tokio::time;
 
 #[cfg(windows)]
-pub async fn handle_failed_and_stuck_messages(
+pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>(
     task_count: u32,
-    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    queue: T,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
 ) {
@@ -24,10 +23,6 @@ pub async fn handle_failed_and_stuck_messages(
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl shutdown to be available");
 
     loop {
-        use std::time::Duration;
-
-        use tokio::time;
-
         let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
             biased;
@@ -55,35 +50,47 @@ pub async fn handle_failed_and_stuck_messages(
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
             },
-            _ = schedule_stuck_jobs(task_count, pool.clone(), main_tracker.clone()) => {
+            _ = schedule_stuck_tasks(task_count, queue.clone(), main_tracker.clone()) => {
                 time::sleep(Duration::from_secs(20)).await;
             },
         }
     }
 }
 
-async fn schedule_stuck_jobs(
+async fn schedule_stuck_tasks<T: Queue + Clone + Send + 'static>(
     task_count: u32,
-    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+    queue: T,
     task_tracker: TaskTracker,
-) -> Result<(), WorkerError> {
+) {
     info!("scheduling {} tasks for stuck jobs", task_count);
 
-    let statement = "WITH task AS (
-    SELECT * FROM messages
-    WHERE (status = 'in_progress' AND last_started_at < NOW() - INTERVAL '5 minutes')
-    OR (status = 'pending' AND last_started_at < NOW() - INTERVAL '5 minutes')
-    ORDER BY priority ASC
-    FOR UPDATE SKIP LOCKED LIMIT 1
-    )
-    UPDATE messages SET status = 'in_progress',
-    last_started_at = NOW()
-    FROM task
-    WHERE messages.id = task.id RETURNING task.*";
-
     for _ in 0..task_count {
-        let cloned_pool = pool.clone();
-        task_tracker.spawn(worker_run(cloned_pool, statement));
+        let worker_queue = queue.clone();
+        task_tracker.spawn(async move {
+            match worker_queue.get_failed_or_stuck_task().await {
+                Ok(task) => {
+                    let Some(task) = task else {
+                        return;
+                    };
+                    let task_id = task.id();
+                    if let Err(err) = worker_run(task).await {
+                        error!(
+                            "Error processing task with id: {}\nerror: {:?}",
+                            task_id, err
+                        );
+                    }
+                    if let Err(err) = worker_queue.update_task_status_to_complete(task_id).await {
+                        error!(
+                            "Error updating task status for task with id: {}\nerror: {:?}",
+                            task_id, err
+                        );
+                    }
+                }
+                Err(err) => error!(
+                    "Couldn't get failed or stuck task from queue\nerror: {:?}",
+                    err
+                ),
+            }
+        });
     }
-    Ok(())
 }

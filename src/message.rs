@@ -3,12 +3,12 @@ use tokio_postgres::Row;
 use tokio_postgres::types::FromSql;
 
 #[derive(Debug)]
-pub struct MessagePayload {
+pub struct TaskPayload {
     id: i32,
     payload: serde_json::Value,
 }
 
-impl MessagePayload {
+impl TaskPayload {
     pub fn id(&self) -> i32 {
         self.id
     }
@@ -18,7 +18,7 @@ impl MessagePayload {
     }
 }
 
-impl TryFrom<Row> for MessagePayload {
+impl TryFrom<Row> for TaskPayload {
     type Error = tokio_postgres::Error;
 
     fn try_from(value: Row) -> Result<Self, Self::Error> {
@@ -31,7 +31,7 @@ impl TryFrom<Row> for MessagePayload {
 
 #[derive(Copy, Clone, Debug, ToSql, FromSql)]
 #[postgres(name = "job_status")]
-pub enum JobStatus {
+pub enum TaskStatus {
     #[postgres(name = "pending")]
     Pending,
     #[postgres(name = "in_progress")]

@@ -1,19 +1,16 @@
-use std::sync::Arc;
-
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
 use futures::channel::mpsc::UnboundedReceiver;
-use tokio_postgres::NoTls;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use tokio_stream::StreamExt;
+use tracing::error;
 use tracing::{debug, info};
 
+use crate::db::Queue;
 use crate::worker_run;
 
 #[cfg(windows)]
-pub async fn handle_tasks_in_real_time(
-    pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
+pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
+    queue: T,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
     mut receiver: UnboundedReceiver<tokio_postgres::AsyncMessage>,
@@ -24,17 +21,6 @@ pub async fn handle_tasks_in_real_time(
     let mut signal_break = windows::ctrl_break().expect("ctrl break to be available");
     let mut signal_close = windows::ctrl_close().expect("ctrl_close to be available");
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl_shutdown to be available");
-
-    let statement = "WITH task AS (
-        SELECT * FROM messages
-        WHERE status = 'pending' AND scheduled_at IS NULL
-        ORDER BY priority ASC, created_at DESC
-        FOR UPDATE SKIP LOCKED LIMIT 1
-        )
-        UPDATE messages SET status = 'in_progress',
-        last_started_at = NOW()
-        FROM task
-        WHERE messages.id = task.id RETURNING task.*";
 
     loop {
         let signal_tracker_handle = main_tracker.clone();
@@ -67,8 +53,19 @@ pub async fn handle_tasks_in_real_time(
             message = receiver.next() => {
                 match message {
                     Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
-                        let worker_pool_handle = pool.clone();
-                        main_tracker.spawn(worker_run(worker_pool_handle.clone(), statement));
+                        let worker_queue = queue.clone();
+
+                        main_tracker.spawn(async move {
+                            if let Ok(Some(task)) = worker_queue.get_newest_pending_task().await {
+                                let task_id = task.id();
+                                if let Err(err) = worker_run(task).await {
+                                    error!("Error processing task with id: {}\nerror: {:?}", task_id, err);
+                                };
+                                if let Err(err) = worker_queue.update_task_status_to_complete(task_id).await {
+                                    error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
+                                };
+                            }
+                        });
                     },
                     Some(n) => debug!("{:?}", n),
                     _ => info!("No notification sent."),
