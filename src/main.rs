@@ -85,7 +85,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     let main_tracker = tracker.clone();
     let pool = conn_pool.clone();
     tokio::join!(
-        real_time_tasks::handle_messages(
+        real_time_tasks::handle_tasks_in_real_time(
             pool.clone(),
             main_tracker.clone(),
             cloned_token.clone(),

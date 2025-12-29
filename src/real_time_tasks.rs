@@ -12,7 +12,7 @@ use tracing::{debug, info};
 use crate::worker_run;
 
 #[cfg(windows)]
-pub async fn handle_messages(
+pub async fn handle_tasks_in_real_time(
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
@@ -24,6 +24,17 @@ pub async fn handle_messages(
     let mut signal_break = windows::ctrl_break().expect("ctrl break to be available");
     let mut signal_close = windows::ctrl_close().expect("ctrl_close to be available");
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl_shutdown to be available");
+
+    let statement = "WITH task AS (
+        SELECT * FROM messages
+        WHERE status = 'pending' AND scheduled_at IS NULL
+        ORDER BY priority ASC, created_at DESC
+        FOR UPDATE SKIP LOCKED LIMIT 1
+        )
+        UPDATE messages SET status = 'in_progress',
+        last_started_at = NOW()
+        FROM task
+        WHERE messages.id = task.id RETURNING task.*";
 
     loop {
         let signal_tracker_handle = main_tracker.clone();
@@ -57,19 +68,7 @@ pub async fn handle_messages(
                 match message {
                     Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
                         let worker_pool_handle = pool.clone();
-                        main_tracker.spawn(async move {
-                            let statement = "WITH task AS (
-                                SELECT * FROM messages
-                                WHERE status = 'pending' AND scheduled_at IS NULL
-                                ORDER BY priority ASC, created_at DESC
-                                FOR UPDATE SKIP LOCKED LIMIT 1
-                                )
-                                UPDATE messages SET status = 'in_progress',
-                                last_started_at = NOW()
-                                FROM task
-                                WHERE messages.id = task.id RETURNING task.*";
-                            let _ = worker_run(worker_pool_handle.clone(), statement).await;
-                        });
+                        main_tracker.spawn(worker_run(worker_pool_handle.clone(), statement));
                     },
                     Some(n) => debug!("{:?}", n),
                     _ => info!("No notification sent."),
