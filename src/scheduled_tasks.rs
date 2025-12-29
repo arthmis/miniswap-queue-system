@@ -11,7 +11,7 @@ use tokio::time;
 #[cfg(windows)]
 pub async fn handle_scheduled_tasks<T>(
     task_count: u32,
-    pool: T,
+    queue: T,
     main_tracker: TaskTracker,
     cancellation_token: CancellationToken,
 ) where
@@ -32,35 +32,46 @@ pub async fn handle_scheduled_tasks<T>(
             biased;
             _ = cancellation_token.cancelled() => {
                 warn!("scheduled tasks received task cancelled");
+                batch_tracker.close();
                 batch_tracker.wait().await;
                 break;
             },
             _ = signal_c.recv() => {
-                info!("received ctrl c signal");
+                warn!("received ctrl c signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
             },
             _ = signal_break.recv() => {
-                info!("received ctrl break signal");
+                warn!("received ctrl break signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
             },
             _ = signal_close.recv() => {
-                info!("received ctrl close signal");
+                warn!("received ctrl close signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
             },
             _ = signal_shutdown.recv() => {
-                info!("received ctrl shutdown signal");
+                warn!("received ctrl shutdown signal");
                 cancellation_token.cancel();
                 signal_tracker_handle.close();
             },
-            result = schedule_tasks(task_count, pool.clone(), batch_tracker.clone(), cancellation_token.clone()) => {
-                let ready_scheduled_tasks_count = result.unwrap();
-                batch_tracker.wait().await;
-                if let None = ready_scheduled_tasks_count {
-                    let sleep_length = Duration::from_secs(10);
-                    warn!("All scheduled tasks complete, sleeping for {:?}", sleep_length);
+            result = schedule_tasks(task_count, queue.clone(), batch_tracker.clone()) => {
+                if let Err(err) = result {
+                    error!("Error handling scheduled tasks\nerror: {:?}", err);
+                }
+
+                let pending_scheduled_tasks_count = match queue.pending_scheduled_tasks_count().await {
+                    Ok(count) => count,
+                    Err(err) => {
+                        error!("Error handling scheduled tasks\nerror: {:?}", err);
+                        continue;
+                    }
+                };
+
+                if pending_scheduled_tasks_count == 0 {
+                    let sleep_length = Duration::from_secs(20);
+                    info!("All scheduled tasks complete, sleeping for {:?}", sleep_length);
                     time::sleep(sleep_length).await;
                 }
             },
@@ -72,17 +83,14 @@ async fn schedule_tasks<T>(
     task_count: u32,
     queue: T,
     batch_tracker: TaskTracker,
-    cancellation_token: CancellationToken,
-) -> Result<Option<u32>, PostgresQueueError>
+) -> Result<(), PostgresQueueError>
 where
     T: Queue + Clone + Send + 'static,
     PostgresQueueError: From<<T as Queue>::QueueError>,
 {
     let pending_scheduled_tasks_count = queue.pending_scheduled_tasks_count().await?;
-
     if pending_scheduled_tasks_count == 0 {
-        info!("No pending scheduled tasks found");
-        return Ok(None);
+        return Ok(());
     }
 
     info!(
@@ -116,19 +124,7 @@ where
     }
 
     batch_tracker.close();
+    batch_tracker.wait().await;
 
-    tokio::select! {
-        biased;
-        _ = cancellation_token.cancelled() => {
-            warn!("Cancellation requested during batch execution, waiting for current batch to complete");
-            batch_tracker.wait().await;
-            warn!("Batch completed after cancellation, exiting schedule_tasks");
-            return Ok( None);
-        }
-        _ = batch_tracker.wait() => {
-            warn!("Batch complete, checking for remaining scheduled tasks");
-        }
-    }
-
-    Ok(Some(pending_scheduled_tasks_count as u32))
+    Ok(())
 }
