@@ -233,3 +233,227 @@ impl From<bb8::RunError<tokio_postgres::Error>> for PostgresQueueError {
         PostgresQueueError::Pool(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::message::TaskStatus;
+
+    use super::*;
+    use chrono::Duration;
+    use chrono::Utc;
+    use rand::Rng;
+    use serde_json::json;
+    use testcontainers_modules::{
+        postgres::{self, Postgres},
+        testcontainers::{ContainerAsync, runners::AsyncRunner},
+    };
+    use tokio_postgres::Config;
+
+    async fn start_postgres() -> (
+        ContainerAsync<Postgres>,
+        Pool<PostgresConnectionManager<NoTls>>,
+    ) {
+        let postgres_instance_handle = postgres::Postgres::default().start().await.unwrap();
+
+        let config = test_container_postgres_config(&postgres_instance_handle).await;
+        let manager = PostgresConnectionManager::new(config.clone(), NoTls);
+        let conn_pool = Pool::builder().build(manager).await.unwrap();
+
+        let conn = conn_pool.get().await.unwrap();
+        run_migrations(conn).await;
+
+        (postgres_instance_handle, conn_pool)
+    }
+
+    async fn test_container_postgres_config(container: &ContainerAsync<Postgres>) -> Config {
+        let mut config = Config::new();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        // make the assumption that the addres is localhost since this is only used in tests
+        // at least for local test running, might need to change with CI
+        let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        config
+            .user("postgres")
+            .dbname("postgres")
+            .password("postgres")
+            .hostaddr(addr)
+            .port(port)
+            .connect_timeout(core::time::Duration::from_secs(10));
+        config
+    }
+
+    async fn run_migrations(conn: PooledConnection<'_, PostgresConnectionManager<NoTls>>) {
+        create_messages_table(conn).await.unwrap();
+    }
+
+    async fn seed_pending_tasks(conn: PooledConnection<'_, PostgresConnectionManager<NoTls>>) {
+        let mut rng = rand::rng();
+
+        let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
+        let actions = ["create", "update", "delete", "process", "sync"];
+        let entities = ["user", "product", "order", "invoice", "subscription"];
+
+        let count = 2;
+        let mut payloads = Vec::new();
+        let scheduled_at_values = vec![None, Some(Utc::now() + Duration::seconds(40))];
+        for (_, scheduled_at) in (0..count).zip(scheduled_at_values.iter()) {
+            let queue_name = queue_names[rng.random_range(0..queue_names.len())];
+            let action = actions[rng.random_range(0..actions.len())];
+            let entity = entities[rng.random_range(0..entities.len())];
+            let priority = rng.random_range(0..=4); // 0 = highest priority, 4 = lowest
+
+            let payload = json!({
+                "action": action,
+                "entity": entity,
+                "entity_id": rng.random_range(1000..9999),
+                "amount": rng.random_range(10.0..1000.0_f64),
+                "priority": priority,
+                "metadata": {
+                    "source": format!("system_{}", rng.random_range(1..10)),
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }
+            });
+            // Randomly decide if this task should be scheduled (50% chance)
+            // let scheduled_at = if rng.random_bool(0.5) {
+            //     // Generate scheduled_at time: 0 to 2 minutes ahead
+            //     let scheduled_seconds_ahead = rng.random_range(0..=120);
+            //     Some(Utc::now() + Duration::seconds(scheduled_seconds_ahead))
+            // } else {
+            //     None
+            // };
+            // let scheduled_at = Some(Utc::now() + Duration::seconds(40));
+
+            payloads.push((queue_name, payload, priority, scheduled_at));
+        }
+        for (queue_name, payload, priority, scheduled_at) in payloads {
+            conn
+                .execute(
+                    "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
+                    &[&queue_name, &payload, &priority, &TaskStatus::Pending, &scheduled_at],
+                )
+                .await.unwrap();
+        }
+    }
+
+    async fn seed_pending_tasks_with_due_scheduled_tasks(
+        conn: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
+    ) {
+        let mut rng = rand::rng();
+
+        let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
+        let actions = ["create", "update", "delete", "process", "sync"];
+        let entities = ["user", "product", "order", "invoice", "subscription"];
+
+        let count = 2;
+        let mut payloads = Vec::new();
+        let scheduled_at_values = vec![None, Some(Utc::now() - Duration::seconds(40))];
+        for (_, scheduled_at) in (0..count).zip(scheduled_at_values.iter()) {
+            let queue_name = queue_names[rng.random_range(0..queue_names.len())];
+            let action = actions[rng.random_range(0..actions.len())];
+            let entity = entities[rng.random_range(0..entities.len())];
+            let priority = rng.random_range(0..=4); // 0 = highest priority, 4 = lowest
+
+            let payload = json!({
+                "action": action,
+                "entity": entity,
+                "entity_id": rng.random_range(1000..9999),
+                "amount": rng.random_range(10.0..1000.0_f64),
+                "priority": priority,
+                "metadata": {
+                    "source": format!("system_{}", rng.random_range(1..10)),
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                }
+            });
+
+            payloads.push((queue_name, payload, priority, scheduled_at));
+        }
+        for (queue_name, payload, priority, scheduled_at) in payloads {
+            conn
+                .execute(
+                    "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
+                    &[&queue_name, &payload, &priority, &TaskStatus::Pending, &scheduled_at],
+                )
+                .await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_pending_task_not_scheduled() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        seed_pending_tasks(conn).await;
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_newest_pending_task().await.unwrap().unwrap();
+        assert_eq!(task.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_pending_scheduled_task_that_is_due() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        seed_pending_tasks_with_due_scheduled_tasks(conn).await;
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_scheduled_task().await.unwrap().unwrap();
+        assert_eq!(task.id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_pending_task_with_future_schedule() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        seed_pending_tasks(conn).await;
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_scheduled_task().await.unwrap();
+        assert!(task.is_none());
+    }
+
+    pub async fn create_messages_table(
+        client: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
+    ) -> Result<(), tokio_postgres::Error> {
+        client
+            .batch_execute(
+                "
+                DO $$ BEGIN
+                    CREATE TYPE job_status AS ENUM ('pending', 'in_progress', 'completed');
+                EXCEPTION
+                    WHEN duplicate_object THEN null;
+                END $$;
+
+                DROP TABLE IF EXISTS messages;
+                CREATE TABLE IF NOT EXISTS messages (
+                    id SERIAL PRIMARY KEY,
+                    queue_name TEXT NOT NULL,
+                    payload JSONB,
+                    priority INTEGER NOT NULL,
+                    status job_status NOT NULL DEFAULT 'pending',
+                    scheduled_at TIMESTAMPTZ,
+                    last_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                CREATE INDEX IF NOT EXISTS message_status_idx
+                ON messages(status, id);
+
+                CREATE OR REPLACE FUNCTION new_job_trigger_fn() RETURNS trigger AS $$
+                BEGIN
+                  PERFORM pg_notify('new_task', NEW.id::text);
+                  RETURN NEW;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                CREATE TRIGGER new_task_trigger
+                AFTER INSERT ON messages
+                FOR EACH ROW
+                EXECUTE FUNCTION new_job_trigger_fn();
+                ",
+            )
+            .await?;
+
+        Ok(())
+    }
+}

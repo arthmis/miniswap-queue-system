@@ -25,9 +25,6 @@ pub async fn create_messages_table(
                 WHEN duplicate_object THEN null;
             END $$;
 
-            CREATE INDEX IF NOT EXISTS message_status_idx
-            ON messages(status, id);
-
             DROP TABLE IF EXISTS messages;
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
@@ -39,6 +36,9 @@ pub async fn create_messages_table(
                 last_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+
+            CREATE INDEX IF NOT EXISTS message_status_idx
+            ON messages(status, id);
 
             CREATE OR REPLACE FUNCTION new_job_trigger_fn() RETURNS trigger AS $$
             BEGIN
