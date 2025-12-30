@@ -33,12 +33,12 @@ pub async fn create_messages_table(
                 priority INTEGER NOT NULL,
                 status job_status NOT NULL DEFAULT 'pending',
                 scheduled_at TIMESTAMPTZ,
-                last_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_started_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
-            CREATE INDEX IF NOT EXISTS message_status_idx
-            ON messages(status, id);
+            CREATE INDEX IF NOT EXISTS message_idx
+            ON messages(id, scheduled_at, status);
 
             CREATE OR REPLACE FUNCTION new_job_trigger_fn() RETURNS trigger AS $$
             BEGIN

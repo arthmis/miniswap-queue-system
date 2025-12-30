@@ -114,7 +114,7 @@ impl Queue for PostgresQueue {
         let statement = "WITH task AS (
          SELECT * FROM messages
          WHERE (status = 'in_progress' AND last_started_at < NOW() - INTERVAL '5 minutes')
-         OR (status = 'pending' AND last_started_at < NOW() - INTERVAL '5 minutes')
+         OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
          ORDER BY priority ASC
          FOR UPDATE SKIP LOCKED LIMIT 1
          )
