@@ -285,56 +285,7 @@ mod tests {
         create_messages_table(conn).await.unwrap();
     }
 
-    async fn seed_pending_tasks(conn: PooledConnection<'_, PostgresConnectionManager<NoTls>>) {
-        let mut rng = rand::rng();
-
-        let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
-        let actions = ["create", "update", "delete", "process", "sync"];
-        let entities = ["user", "product", "order", "invoice", "subscription"];
-
-        let count = 2;
-        let mut payloads = Vec::new();
-        let scheduled_at_values = vec![None, Some(Utc::now() + Duration::seconds(40))];
-        for (_, scheduled_at) in (0..count).zip(scheduled_at_values.iter()) {
-            let queue_name = queue_names[rng.random_range(0..queue_names.len())];
-            let action = actions[rng.random_range(0..actions.len())];
-            let entity = entities[rng.random_range(0..entities.len())];
-            let priority = rng.random_range(0..=4); // 0 = highest priority, 4 = lowest
-
-            let payload = json!({
-                "action": action,
-                "entity": entity,
-                "entity_id": rng.random_range(1000..9999),
-                "amount": rng.random_range(10.0..1000.0_f64),
-                "priority": priority,
-                "metadata": {
-                    "source": format!("system_{}", rng.random_range(1..10)),
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                }
-            });
-            // Randomly decide if this task should be scheduled (50% chance)
-            // let scheduled_at = if rng.random_bool(0.5) {
-            //     // Generate scheduled_at time: 0 to 2 minutes ahead
-            //     let scheduled_seconds_ahead = rng.random_range(0..=120);
-            //     Some(Utc::now() + Duration::seconds(scheduled_seconds_ahead))
-            // } else {
-            //     None
-            // };
-            // let scheduled_at = Some(Utc::now() + Duration::seconds(40));
-
-            payloads.push((queue_name, payload, priority, scheduled_at));
-        }
-        for (queue_name, payload, priority, scheduled_at) in payloads {
-            conn
-                .execute(
-                    "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
-                    &[&queue_name, &payload, &priority, &TaskStatus::Pending, &scheduled_at],
-                )
-                .await.unwrap();
-        }
-    }
-
-    struct TaskTestConfig {
+    struct TaskGenConfig {
         status: Option<TaskStatus>,
         priority: Option<i32>,
         scheduled_at: Option<chrono::DateTime<Utc>>,
@@ -343,7 +294,7 @@ mod tests {
     }
 
     async fn create_task(
-        config: TaskTestConfig,
+        config: TaskGenConfig,
         conn: &PooledConnection<'_, PostgresConnectionManager<NoTls>>,
     ) {
         let mut rng = rand::rng();
@@ -367,14 +318,8 @@ mod tests {
             }
         });
 
-        let scheduled_at = config.scheduled_at.unwrap_or_else(|| {
-            let scheduled_seconds_ahead = rng.random_range(0..=120);
-            Utc::now() + Duration::seconds(scheduled_seconds_ahead)
-        });
-        let last_started_at = config.last_started_at.unwrap_or_else(|| {
-            let seconds = rng.random_range(0..=120);
-            Utc::now() - Duration::seconds(seconds)
-        });
+        let scheduled_at = config.scheduled_at;
+        let last_started_at = config.last_started_at;
         let status = config.status.unwrap_or(TaskStatus::Pending);
         let priority = config.priority.unwrap_or_else(|| {
             rng.random_range(0..=4) // 0 = highest priority, 4 = lowest
@@ -388,53 +333,31 @@ mod tests {
             )
             .await.unwrap();
     }
-    async fn seed_pending_tasks_with_due_scheduled_tasks(
-        conn: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
-    ) {
-        let mut rng = rand::rng();
-
-        let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
-        let actions = ["create", "update", "delete", "process", "sync"];
-        let entities = ["user", "product", "order", "invoice", "subscription"];
-
-        let count = 2;
-        let mut payloads = Vec::new();
-        let scheduled_at_values = vec![None, Some(Utc::now() - Duration::seconds(40))];
-        for (_, scheduled_at) in (0..count).zip(scheduled_at_values.iter()) {
-            let queue_name = queue_names[rng.random_range(0..queue_names.len())];
-            let action = actions[rng.random_range(0..actions.len())];
-            let entity = entities[rng.random_range(0..entities.len())];
-            let priority = rng.random_range(0..=4); // 0 = highest priority, 4 = lowest
-
-            let payload = json!({
-                "action": action,
-                "entity": entity,
-                "entity_id": rng.random_range(1000..9999),
-                "amount": rng.random_range(10.0..1000.0_f64),
-                "priority": priority,
-                "metadata": {
-                    "source": format!("system_{}", rng.random_range(1..10)),
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                }
-            });
-
-            payloads.push((queue_name, payload, priority, scheduled_at));
-        }
-        for (queue_name, payload, priority, scheduled_at) in payloads {
-            conn
-                .execute(
-                    "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
-                    &[&queue_name, &payload, &priority, &TaskStatus::Pending, &scheduled_at],
-                )
-                .await.unwrap();
-        }
-    }
 
     #[tokio::test]
     async fn test_get_pending_task_not_scheduled() {
         let (_postgres_instance_handle, pool) = start_postgres().await;
         let conn = pool.get().await.unwrap();
-        seed_pending_tasks(conn).await;
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: Some(Utc::now() + Duration::seconds(40)),
+                last_started_at: None,
+                created_at: None,
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
 
         let queue = PostgresQueue::new(pool.clone());
 
@@ -446,7 +369,26 @@ mod tests {
     async fn test_get_pending_scheduled_task_that_is_due() {
         let (_postgres_instance_handle, pool) = start_postgres().await;
         let conn = pool.get().await.unwrap();
-        seed_pending_tasks_with_due_scheduled_tasks(conn).await;
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: Some(Utc::now() - Duration::seconds(40)),
+                last_started_at: None,
+                created_at: None,
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
 
         let queue = PostgresQueue::new(pool.clone());
 
@@ -458,7 +400,26 @@ mod tests {
     async fn test_get_pending_task_with_future_schedule() {
         let (_postgres_instance_handle, pool) = start_postgres().await;
         let conn = pool.get().await.unwrap();
-        seed_pending_tasks(conn).await;
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: Some(Utc::now() + Duration::seconds(40)),
+                last_started_at: None,
+                created_at: None,
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
 
         let queue = PostgresQueue::new(pool.clone());
 
@@ -470,22 +431,22 @@ mod tests {
     async fn test_get_stuck_task_while_there_are_none() {
         let (_postgres_instance_handle, pool) = start_postgres().await;
         let conn = pool.get().await.unwrap();
-        let task_parameters: Vec<TaskTestConfig> = vec![
-            TaskTestConfig {
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
                 status: Some(TaskStatus::Completed),
                 priority: None,
                 scheduled_at: None,
                 last_started_at: None,
                 created_at: None,
             },
-            TaskTestConfig {
+            TaskGenConfig {
                 status: Some(TaskStatus::Pending),
                 priority: None,
                 scheduled_at: None,
                 last_started_at: None,
                 created_at: None,
             },
-            TaskTestConfig {
+            TaskGenConfig {
                 status: Some(TaskStatus::Pending),
                 priority: None,
                 scheduled_at: Some(Utc::now() - Duration::seconds(150)),
@@ -508,22 +469,22 @@ mod tests {
     async fn test_get_stuck_task_while_there_are_some() {
         let (_postgres_instance_handle, pool) = start_postgres().await;
         let conn = pool.get().await.unwrap();
-        let task_parameters: Vec<TaskTestConfig> = vec![
-            TaskTestConfig {
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
                 status: Some(TaskStatus::Completed),
                 priority: None,
                 scheduled_at: None,
                 last_started_at: None,
                 created_at: None,
             },
-            TaskTestConfig {
+            TaskGenConfig {
                 status: Some(TaskStatus::InProgress),
                 priority: None,
                 scheduled_at: None,
                 last_started_at: None,
                 created_at: None,
             },
-            TaskTestConfig {
+            TaskGenConfig {
                 status: Some(TaskStatus::Pending),
                 priority: None,
                 scheduled_at: Some(Utc::now() - Duration::seconds(300)),
