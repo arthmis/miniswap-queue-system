@@ -334,6 +334,60 @@ mod tests {
         }
     }
 
+    struct TaskTestConfig {
+        status: Option<TaskStatus>,
+        priority: Option<i32>,
+        scheduled_at: Option<chrono::DateTime<Utc>>,
+        last_started_at: Option<chrono::DateTime<Utc>>,
+        created_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    async fn create_task(
+        config: TaskTestConfig,
+        conn: &PooledConnection<'_, PostgresConnectionManager<NoTls>>,
+    ) {
+        let mut rng = rand::rng();
+
+        let queue_names = ["orders", "notifications", "payments", "analytics", "emails"];
+        let actions = ["create", "update", "delete", "process", "sync"];
+        let entities = ["user", "product", "order", "invoice", "subscription"];
+
+        let queue_name = queue_names[rng.random_range(0..queue_names.len())];
+        let action = actions[rng.random_range(0..actions.len())];
+        let entity = entities[rng.random_range(0..entities.len())];
+
+        let payload = json!({
+            "action": action,
+            "entity": entity,
+            "entity_id": rng.random_range(1000..9999),
+            "amount": rng.random_range(10.0..1000.0_f64),
+            "metadata": {
+                "source": format!("system_{}", rng.random_range(1..10)),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }
+        });
+
+        let scheduled_at = config.scheduled_at.unwrap_or_else(|| {
+            let scheduled_seconds_ahead = rng.random_range(0..=120);
+            Utc::now() + Duration::seconds(scheduled_seconds_ahead)
+        });
+        let last_started_at = config.last_started_at.unwrap_or_else(|| {
+            let seconds = rng.random_range(0..=120);
+            Utc::now() - Duration::seconds(seconds)
+        });
+        let status = config.status.unwrap_or(TaskStatus::Pending);
+        let priority = config.priority.unwrap_or_else(|| {
+            rng.random_range(0..=4) // 0 = highest priority, 4 = lowest
+        });
+        let created_at = config.created_at.unwrap_or_else(Utc::now);
+
+        conn
+            .execute(
+                "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at, last_started_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                &[&queue_name, &payload, &priority, &status, &scheduled_at, &last_started_at, &created_at],
+            )
+            .await.unwrap();
+    }
     async fn seed_pending_tasks_with_due_scheduled_tasks(
         conn: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
     ) {
@@ -412,6 +466,84 @@ mod tests {
         assert!(task.is_none());
     }
 
+    #[tokio::test]
+    async fn test_get_stuck_task_while_there_are_none() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        let task_parameters: Vec<TaskTestConfig> = vec![
+            TaskTestConfig {
+                status: Some(TaskStatus::Completed),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskTestConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskTestConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: Some(Utc::now() - Duration::seconds(150)),
+                last_started_at: None,
+                created_at: None,
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_failed_or_stuck_task().await.unwrap();
+        assert!(task.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_stuck_task_while_there_are_some() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        let task_parameters: Vec<TaskTestConfig> = vec![
+            TaskTestConfig {
+                status: Some(TaskStatus::Completed),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskTestConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskTestConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: Some(Utc::now() - Duration::seconds(300)),
+                last_started_at: None,
+                created_at: Some(Utc::now() - Duration::seconds(600)),
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_failed_or_stuck_task().await.unwrap();
+        assert!(task.is_some());
+        let task = task.unwrap();
+        assert_eq!(task.id(), 3);
+    }
+
     pub async fn create_messages_table(
         client: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
     ) -> Result<(), tokio_postgres::Error> {
@@ -432,7 +564,7 @@ mod tests {
                     priority INTEGER NOT NULL,
                     status job_status NOT NULL DEFAULT 'pending',
                     scheduled_at TIMESTAMPTZ,
-                    last_started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_started_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
 
