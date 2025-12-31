@@ -3,6 +3,9 @@ name = "miniswap-task"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "generate_tasks"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

@@ -1,10 +1,8 @@
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::db::Queue;
-use crate::message::TaskStatus;
-use crate::{delete_completed_tasks, worker_run};
 use std::time::Duration;
 
 use tokio::time;

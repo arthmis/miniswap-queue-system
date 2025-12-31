@@ -6,16 +6,11 @@ mod message;
 mod real_time_tasks;
 mod retry;
 mod scheduled_tasks;
-mod simulated_data_generation;
-
-use std::sync::Arc;
-use std::time::Duration;
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::Rng;
-use tokio::time;
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Level;
@@ -23,9 +18,6 @@ use tracing::error;
 use tracing::info;
 
 use crate::db::PostgresQueue;
-use crate::delete_completed_tasks::periodically_delete_completed_tasks;
-use crate::simulated_data_generation::create_messages_table;
-use crate::simulated_data_generation::insert_test_messages;
 use crate::{
     errors::{MessageProcessingError, WorkerError},
     message::TaskPayload,
@@ -49,18 +41,6 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         .port(7777)
         .connect_timeout(core::time::Duration::from_secs(10));
 
-    let data_generation_conn_pool = {
-        let manager = PostgresConnectionManager::new(config.clone(), NoTls);
-        let conn_pool = match Pool::builder().build(manager).await {
-            Ok(pool) => pool,
-            Err(err) => {
-                error!("{:?}", err);
-                panic!("expected to make a connection to the database");
-            }
-        };
-        Arc::new(conn_pool)
-    };
-
     let (sender, receiver) = futures::channel::mpsc::unbounded();
     let listen_config = config.clone();
     let (client, mut connection) = listen_config.connect(NoTls).await.unwrap();
@@ -71,14 +51,6 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     tokio::spawn(listen_connection);
 
     client.execute("LISTEN new_task", &[]).await.unwrap();
-
-    // create_messages_table(data_generation_conn_pool.clone()).await.unwrap();
-
-    tokio::spawn(async move {
-        insert_test_messages(data_generation_conn_pool.clone(), 40)
-            .await
-            .unwrap();
-    });
 
     let tracker = TaskTracker::new();
 

@@ -25,6 +25,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER new_task_trigger
+CREATE OR REPLACE TRIGGER new_task_trigger
 AFTER INSERT ON messages
 FOR EACH ROW EXECUTE FUNCTION new_job_trigger_fn();

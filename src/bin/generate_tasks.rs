@@ -1,14 +1,55 @@
-use std::{sync::Arc, time::Duration as StdDuration};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use chrono::{Duration, Utc};
+use chrono::Utc;
+use postgres_types::FromSql;
+use postgres_types::ToSql;
 use rand::Rng;
+use rand::random_range;
 use serde_json::json;
 use tokio::time::sleep;
-use tokio_postgres::NoTls;
+use tokio_postgres::{Config, NoTls};
+use tracing::error;
 
-use crate::message::TaskStatus;
+#[tokio::main]
+async fn main() -> Result<(), tokio_postgres::Error> {
+    let mut config = Config::new();
+    config
+        .user("miniswap")
+        .dbname("miniswap")
+        .password("miniswap")
+        .hostaddr(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+        .port(7777)
+        .connect_timeout(core::time::Duration::from_secs(10));
+
+    let data_generation_conn_pool = {
+        let manager = PostgresConnectionManager::new(config.clone(), NoTls);
+        let conn_pool = match Pool::builder().build(manager).await {
+            Ok(pool) => pool,
+            Err(err) => {
+                error!("{:?}", err);
+                panic!("expected to make a connection to the database");
+            }
+        };
+        Arc::new(conn_pool)
+    };
+
+    create_messages_table(data_generation_conn_pool.clone())
+        .await
+        .unwrap();
+
+    let handle = tokio::spawn(async move {
+        insert_test_messages(data_generation_conn_pool.clone(), 40)
+            .await
+            .unwrap();
+    });
+
+    let _ = handle.await;
+
+    Ok(())
+}
 
 pub async fn create_messages_table(
     pool: Arc<Pool<PostgresConnectionManager<NoTls>>>,
@@ -25,7 +66,6 @@ pub async fn create_messages_table(
                 WHEN duplicate_object THEN null;
             END $$;
 
-            DROP TABLE IF EXISTS messages;
             CREATE TABLE IF NOT EXISTS messages (
                 id SERIAL PRIMARY KEY,
                 queue_name TEXT NOT NULL,
@@ -47,7 +87,7 @@ pub async fn create_messages_table(
             END;
             $$ LANGUAGE plpgsql;
 
-            CREATE TRIGGER new_task_trigger
+            CREATE OR REPLACE TRIGGER new_task_trigger
             AFTER INSERT ON messages
             FOR EACH ROW
             EXECUTE FUNCTION new_job_trigger_fn();
@@ -94,7 +134,7 @@ pub async fn insert_test_messages(
                 let scheduled_at = if rng.random_bool(0.5) {
                     // Generate scheduled_at time: 0 to 2 minutes ahead
                     let scheduled_seconds_ahead = rng.random_range(0..=120);
-                    Some(Utc::now() + Duration::seconds(scheduled_seconds_ahead))
+                    Some(Utc::now() + chrono::Duration::seconds(scheduled_seconds_ahead))
                 } else {
                     None
                 };
@@ -110,8 +150,19 @@ pub async fn insert_test_messages(
                     "INSERT INTO messages (queue_name, payload, priority, status, scheduled_at) VALUES ($1, $2, $3, $4, $5)",
                     &[&queue_name, &payload, &priority, &TaskStatus::Pending, &scheduled_at],
                 )
-                .await?;
+                .await.unwrap();
+            sleep(Duration::from_millis(random_range(30..800))).await;
         }
-        sleep(StdDuration::from_secs(5)).await;
     }
+}
+
+#[derive(Copy, Clone, Debug, ToSql, FromSql, Eq, PartialEq)]
+#[postgres(name = "job_status")]
+pub enum TaskStatus {
+    #[postgres(name = "pending")]
+    Pending,
+    #[postgres(name = "in_progress")]
+    InProgress,
+    #[postgres(name = "completed")]
+    Completed,
 }
