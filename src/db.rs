@@ -112,14 +112,16 @@ impl Queue for PostgresQueue {
 
     async fn get_failed_or_stuck_task(&self) -> Result<Option<TaskPayload>, Self::QueueError> {
         let statement = "WITH task AS (
-         SELECT * FROM messages
-         WHERE (status = 'in_progress' AND last_started_at < NOW() - INTERVAL '5 minutes')
-         OR (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
-         ORDER BY priority ASC
-         FOR UPDATE SKIP LOCKED LIMIT 1
+            SELECT * FROM messages
+            WHERE
+                (status = 'in_progress' AND last_started_at IS NOT NULL AND last_started_at < NOW() - INTERVAL '5 minutes')
+                OR (status = 'pending' AND scheduled_at IS NOT NULL AND scheduled_at < NOW() - INTERVAL '5 minutes')
+                OR (status = 'pending' AND scheduled_at IS NULL AND created_at < NOW() - INTERVAL '5 minutes')
+            ORDER BY priority, scheduled_at, created_at, id
+            FOR UPDATE SKIP LOCKED LIMIT 1
          )
          UPDATE messages SET status = 'in_progress',
-         last_started_at = NOW()
+            last_started_at = NOW()
          FROM task
          WHERE messages.id = task.id RETURNING task.*";
 
@@ -321,9 +323,7 @@ mod tests {
         let scheduled_at = config.scheduled_at;
         let last_started_at = config.last_started_at;
         let status = config.status.unwrap_or(TaskStatus::Pending);
-        let priority = config.priority.unwrap_or_else(|| {
-            rng.random_range(0..=4) // 0 = highest priority, 4 = lowest
-        });
+        let priority = config.priority.unwrap_or(0);
         let created_at = config.created_at.unwrap_or_else(Utc::now);
 
         conn
@@ -449,9 +449,16 @@ mod tests {
             TaskGenConfig {
                 status: Some(TaskStatus::Pending),
                 priority: None,
-                scheduled_at: Some(Utc::now() - Duration::seconds(150)),
+                scheduled_at: Some(Utc::now() + Duration::seconds(150)),
                 last_started_at: None,
                 created_at: None,
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: Some(Utc::now() - Duration::seconds(150)),
+                last_started_at: Some(Utc::now() - Duration::seconds(140)),
+                created_at: Some(Utc::now() - Duration::seconds(200)),
             },
         ];
 
@@ -487,7 +494,7 @@ mod tests {
             TaskGenConfig {
                 status: Some(TaskStatus::Pending),
                 priority: None,
-                scheduled_at: Some(Utc::now() - Duration::seconds(300)),
+                scheduled_at: Some(Utc::now() - Duration::seconds(400)),
                 last_started_at: None,
                 created_at: Some(Utc::now() - Duration::seconds(600)),
             },
@@ -505,7 +512,76 @@ mod tests {
         assert_eq!(task.id(), 3);
     }
 
-    pub async fn create_messages_table(
+    #[tokio::test]
+    async fn test_get_stuck_tasks_with_scheduled_task_in_order() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        let now = Utc::now();
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
+                status: Some(TaskStatus::Completed),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: None,
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: Some(now - Duration::seconds(348)),
+                created_at: Some(now - Duration::seconds(400)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: Some(now - Duration::seconds(400)),
+                last_started_at: None,
+                created_at: Some(now - Duration::seconds(600)),
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_failed_or_stuck_task().await.unwrap().unwrap();
+        assert_eq!(task.id(), 3);
+        queue
+            .update_task_status_to_complete(task.id())
+            .await
+            .unwrap();
+
+        let task = queue.get_failed_or_stuck_task().await.unwrap().unwrap();
+        assert_eq!(task.id(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_stuck_in_progress_scheduled_task() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        let now = Utc::now();
+        let task_parameters: Vec<TaskGenConfig> = vec![TaskGenConfig {
+            status: Some(TaskStatus::InProgress),
+            priority: None,
+            scheduled_at: Some(now - Duration::seconds(400)),
+            last_started_at: Some(now - Duration::seconds(401)),
+            created_at: Some(now - Duration::seconds(600)),
+        }];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let task = queue.get_failed_or_stuck_task().await.unwrap().unwrap();
+        assert_eq!(task.id(), 1);
+    }
+
+    async fn create_messages_table(
         client: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
     ) -> Result<(), tokio_postgres::Error> {
         client
