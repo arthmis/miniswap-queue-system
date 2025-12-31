@@ -3,9 +3,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
 
-#[cfg(windows)]
 use crate::db::Queue;
-use crate::{db::PostgresQueueError, worker_run};
+use crate::{db::PostgresQueueError, message::TaskStatus, worker_run};
 use tokio::time;
 
 #[cfg(windows)]
@@ -113,7 +112,10 @@ where
                         task_id, err
                     );
                 };
-                if let Err(err) = worker_queue.update_task_status_to_complete(task_id).await {
+                if let Err(err) = worker_queue
+                    .update_task_status(task_id, TaskStatus::Completed)
+                    .await
+                {
                     error!(
                         "Error updating scheduled task status for task with id: {}\nerror: {:?}",
                         task_id, err

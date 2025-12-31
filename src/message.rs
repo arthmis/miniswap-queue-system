@@ -29,7 +29,7 @@ impl TryFrom<Row> for TaskPayload {
     }
 }
 
-#[derive(Copy, Clone, Debug, ToSql, FromSql)]
+#[derive(Copy, Clone, Debug, ToSql, FromSql, Eq, PartialEq)]
 #[postgres(name = "job_status")]
 pub enum TaskStatus {
     #[postgres(name = "pending")]

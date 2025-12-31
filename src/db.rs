@@ -6,7 +6,7 @@ use tokio_postgres::NoTls;
 use tracing::error;
 
 use crate::{
-    message::TaskPayload,
+    message::{TaskPayload, TaskStatus},
     retry::{RetryStrategy, retry},
 };
 
@@ -26,9 +26,10 @@ pub trait Queue {
         &self,
     ) -> impl Future<Output = Result<Option<TaskPayload>, Self::QueueError>> + Send;
     /// Update the task status
-    fn update_task_status_to_complete(
+    fn update_task_status(
         &self,
         task_id: i32,
+        new_status: TaskStatus,
     ) -> impl Future<Output = Result<(), Self::QueueError>> + Send;
     /// Get count of scheduled tasks that are due
     fn pending_scheduled_tasks_count(
@@ -169,12 +170,18 @@ impl Queue for PostgresQueue {
         Ok(Some(payload))
     }
 
-    async fn update_task_status_to_complete(&self, task_id: i32) -> Result<(), Self::QueueError> {
-        let statement = "UPDATE messages SET status = 'completed' WHERE id = $1";
+    async fn update_task_status(
+        &self,
+        task_id: i32,
+        new_status: TaskStatus,
+    ) -> Result<(), Self::QueueError> {
+        let statement = "UPDATE messages SET status = $2 WHERE id = $1";
 
         let mut connection = self.get_connection().await?;
         let transaction = connection.transaction().await?;
-        let _status_update_result = transaction.execute(statement, &[&task_id]).await?;
+        let _status_update_result = transaction
+            .execute(statement, &[&task_id, &new_status])
+            .await?;
 
         transaction.commit().await?;
         Ok(())
@@ -550,7 +557,7 @@ mod tests {
         let task = queue.get_failed_or_stuck_task().await.unwrap().unwrap();
         assert_eq!(task.id(), 3);
         queue
-            .update_task_status_to_complete(task.id())
+            .update_task_status(task.id(), TaskStatus::Completed)
             .await
             .unwrap();
 
@@ -579,6 +586,94 @@ mod tests {
 
         let task = queue.get_failed_or_stuck_task().await.unwrap().unwrap();
         assert_eq!(task.id(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_task_status() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        let now = Utc::now();
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: Some(now - Duration::seconds(400)),
+                last_started_at: Some(now - Duration::seconds(401)),
+                created_at: Some(now - Duration::seconds(600)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: Some(now - Duration::seconds(600)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: Some(now - Duration::seconds(500)),
+                created_at: Some(now - Duration::seconds(600)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Completed),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: Some(now - Duration::seconds(500)),
+                created_at: Some(now - Duration::seconds(600)),
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        queue
+            .update_task_status(1, TaskStatus::Completed)
+            .await
+            .unwrap();
+        queue
+            .update_task_status(2, TaskStatus::InProgress)
+            .await
+            .unwrap();
+        queue
+            .update_task_status(3, TaskStatus::Pending)
+            .await
+            .unwrap();
+        queue
+            .update_task_status(4, TaskStatus::Completed)
+            .await
+            .unwrap();
+
+        let row = conn
+            .query_one("SELECT status FROM messages WHERE id = 1", &[])
+            .await
+            .unwrap();
+        let stored_status: TaskStatus = row.get("status");
+        assert_eq!(stored_status, TaskStatus::Completed);
+
+        let row = conn
+            .query_one("SELECT status FROM messages WHERE id = 2", &[])
+            .await
+            .unwrap();
+        let stored_status: TaskStatus = row.get("status");
+        assert_eq!(stored_status, TaskStatus::InProgress);
+
+        let row = conn
+            .query_one("SELECT status FROM messages WHERE id = 3", &[])
+            .await
+            .unwrap();
+        let stored_status: TaskStatus = row.get("status");
+        assert_eq!(stored_status, TaskStatus::Pending);
+
+        let row = conn
+            .query_one("SELECT status FROM messages WHERE id = 4", &[])
+            .await
+            .unwrap();
+        let stored_status: TaskStatus = row.get("status");
+        assert_eq!(stored_status, TaskStatus::Completed);
     }
 
     async fn create_messages_table(

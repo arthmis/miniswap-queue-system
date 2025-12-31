@@ -3,6 +3,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{error, info};
 
 use crate::db::Queue;
+use crate::message::TaskStatus;
 use crate::worker_run;
 use std::time::Duration;
 
@@ -79,7 +80,10 @@ async fn schedule_stuck_tasks<T: Queue + Clone + Send + 'static>(
                             task_id, err
                         );
                     }
-                    if let Err(err) = worker_queue.update_task_status_to_complete(task_id).await {
+                    if let Err(err) = worker_queue
+                        .update_task_status(task_id, TaskStatus::Completed)
+                        .await
+                    {
                         error!(
                             "Error updating task status for task with id: {}\nerror: {:?}",
                             task_id, err
