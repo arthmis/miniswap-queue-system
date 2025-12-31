@@ -23,8 +23,8 @@ pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>
     let mut signal_close = windows::ctrl_close().expect("ctrl close to be available");
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl shutdown to be available");
 
+    let signal_tracker_handle = main_tracker.clone();
     loop {
-        let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {

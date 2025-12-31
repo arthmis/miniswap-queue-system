@@ -35,6 +35,11 @@ pub trait Queue {
     fn pending_scheduled_tasks_count(
         &self,
     ) -> impl Future<Output = Result<i64, Self::QueueError>> + Send;
+    // Questions:
+    // Do you need to retain these tasks for audits or anything like that
+    // When would you want to delete this data or archive it to keep the disk usage compact?
+    /// Delete all completed tasks
+    fn delete_completed_tasks(&self) -> impl Future<Output = Result<u64, Self::QueueError>> + Send;
 }
 
 #[derive(Clone)]
@@ -199,6 +204,21 @@ impl Queue for PostgresQueue {
 
         let pending_count = row.get(0);
         Ok(pending_count)
+    }
+
+    async fn delete_completed_tasks(&self) -> Result<u64, Self::QueueError> {
+        let statement = "DELETE FROM messages WHERE status = 'completed'";
+
+        let mut connection = self.get_connection().await?;
+        let transaction = connection.transaction().await?;
+        let count_affected_rows = transaction.execute(statement, &[]).await.map_err(|err| {
+            error!("Failed to delete completed tasks\nerror: {:?}", err);
+            return err;
+        })?;
+
+        transaction.commit().await?;
+
+        Ok(count_affected_rows)
     }
 }
 

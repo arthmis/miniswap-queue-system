@@ -23,8 +23,8 @@ pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
     let mut signal_close = windows::ctrl_close().expect("ctrl_close to be available");
     let mut signal_shutdown = windows::ctrl_shutdown().expect("ctrl_shutdown to be available");
 
+    let signal_tracker_handle = main_tracker.clone();
     loop {
-        let signal_tracker_handle = main_tracker.clone();
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {

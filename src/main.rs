@@ -1,5 +1,6 @@
 mod clean_up_stuck_tasks;
 mod db;
+mod delete_completed_tasks;
 mod errors;
 mod message;
 mod real_time_tasks;
@@ -22,6 +23,7 @@ use tracing::error;
 use tracing::info;
 
 use crate::db::PostgresQueue;
+use crate::delete_completed_tasks::periodically_delete_completed_tasks;
 use crate::simulated_data_generation::create_messages_table;
 use crate::simulated_data_generation::insert_test_messages;
 use crate::{
@@ -72,11 +74,11 @@ async fn main() -> Result<(), tokio_postgres::Error> {
 
     // create_messages_table(data_generation_conn_pool.clone()).await.unwrap();
 
-    // tokio::spawn(async move {
-    //     insert_test_messages(data_generation_conn_pool.clone(), 40)
-    //         .await
-    //         .unwrap();
-    // });
+    tokio::spawn(async move {
+        insert_test_messages(data_generation_conn_pool.clone(), 40)
+            .await
+            .unwrap();
+    });
 
     let tracker = TaskTracker::new();
 
@@ -112,6 +114,11 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         ),
         scheduled_tasks::handle_scheduled_tasks(
             task_count,
+            queue.clone(),
+            main_tracker.clone(),
+            cloned_token.clone()
+        ),
+        delete_completed_tasks::periodically_delete_completed_tasks(
             queue.clone(),
             main_tracker.clone(),
             cloned_token.clone()
