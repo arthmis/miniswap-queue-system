@@ -7,10 +7,14 @@ mod real_time_tasks;
 mod retry;
 mod scheduled_tasks;
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::{StreamExt, TryStreamExt, stream};
 use rand::Rng;
+use tokio_postgres::AsyncMessage;
 use tokio_postgres::{Config, NoTls};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::Level;
@@ -37,27 +41,15 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         .user("miniswap")
         .dbname("miniswap")
         .password("miniswap")
-        .hostaddr(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+        .hostaddr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
         .port(7777)
         .connect_timeout(core::time::Duration::from_secs(10));
 
-    let (sender, receiver) = futures::channel::mpsc::unbounded();
-    let listen_config = config.clone();
-    let (client, mut connection) = listen_config.connect(NoTls).await.unwrap();
-
-    let stream = stream::poll_fn(move |context| connection.poll_message(context))
-        .map_err(|e| panic!("{}", e));
-    let listen_connection = stream.forward(sender);
-    tokio::spawn(listen_connection);
-
-    client.execute("LISTEN new_task", &[]).await.unwrap();
+    let receiver = setup_realtime_task_listener_channel(config.clone()).await;
 
     let tracker = TaskTracker::new();
-
-    let token = CancellationToken::new();
-
+    let cancellation_token = CancellationToken::new();
     let task_count: u32 = 10;
-
     let queue = {
         let manager = PostgresConnectionManager::new(config.clone(), NoTls);
         let conn_pool = match Pool::builder().build(manager).await {
@@ -69,31 +61,30 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         };
         PostgresQueue::new(conn_pool)
     };
-    let cloned_token = token.clone();
-    let main_tracker = tracker.clone();
+
     tokio::join!(
         real_time_tasks::handle_tasks_in_real_time(
             queue.clone(),
-            main_tracker.clone(),
-            cloned_token.clone(),
+            tracker.clone(),
+            cancellation_token.clone(),
             receiver,
         ),
         clean_up_stuck_tasks::handle_failed_and_stuck_messages(
             task_count,
             queue.clone(),
-            main_tracker.clone(),
-            cloned_token.clone(),
+            tracker.clone(),
+            cancellation_token.clone(),
         ),
         scheduled_tasks::handle_scheduled_tasks(
             task_count,
             queue.clone(),
-            main_tracker.clone(),
-            cloned_token.clone()
+            tracker.clone(),
+            cancellation_token.clone()
         ),
         delete_completed_tasks::periodically_delete_completed_tasks(
             queue.clone(),
-            main_tracker.clone(),
-            cloned_token.clone()
+            tracker.clone(),
+            cancellation_token.clone()
         )
     );
 
@@ -101,6 +92,19 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     tracker.wait().await;
 
     Ok(())
+}
+
+async fn setup_realtime_task_listener_channel(config: Config) -> UnboundedReceiver<AsyncMessage> {
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    let (client, mut connection) = config.connect(NoTls).await.unwrap();
+
+    let stream = stream::poll_fn(move |context| connection.poll_message(context))
+        .map_err(|e| panic!("{}", e));
+    let listen_connection = stream.forward(sender);
+    tokio::spawn(listen_connection);
+
+    client.execute("LISTEN new_task", &[]).await.unwrap();
+    receiver
 }
 
 pub async fn worker_run(task: TaskPayload) -> Result<(), WorkerError> {
