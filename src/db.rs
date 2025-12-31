@@ -696,6 +696,53 @@ mod tests {
         assert_eq!(stored_status, TaskStatus::Completed);
     }
 
+    #[tokio::test]
+    async fn test_delete_completed_tasks() {
+        let (_postgres_instance_handle, pool) = start_postgres().await;
+        let conn = pool.get().await.unwrap();
+        let now = Utc::now();
+        let task_parameters: Vec<TaskGenConfig> = vec![
+            TaskGenConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: Some(now - Duration::seconds(400)),
+                last_started_at: Some(now - Duration::seconds(401)),
+                created_at: Some(now - Duration::seconds(600)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Pending),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: None,
+                created_at: Some(now - Duration::seconds(600)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::InProgress),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: Some(now - Duration::seconds(500)),
+                created_at: Some(now - Duration::seconds(600)),
+            },
+            TaskGenConfig {
+                status: Some(TaskStatus::Completed),
+                priority: None,
+                scheduled_at: None,
+                last_started_at: Some(now - Duration::seconds(500)),
+                created_at: Some(now - Duration::seconds(600)),
+            },
+        ];
+
+        for config in task_parameters {
+            create_task(config, &conn).await;
+        }
+
+        let queue = PostgresQueue::new(pool.clone());
+
+        let count_deleted = queue.delete_completed_tasks().await.unwrap();
+
+        assert_eq!(count_deleted, 1);
+    }
+
     async fn create_messages_table(
         client: PooledConnection<'_, PostgresConnectionManager<NoTls>>,
     ) -> Result<(), tokio_postgres::Error> {
