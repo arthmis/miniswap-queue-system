@@ -7,6 +7,46 @@ use std::time::Duration;
 
 use tokio::time;
 
+
+#[cfg(unix)]
+pub async fn periodically_delete_completed_tasks<T: Queue + Clone + Send + 'static>(
+    queue: T,
+    main_tracker: TaskTracker,
+    cancellation_token: CancellationToken,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut signal_terminate =
+        signal(SignalKind::terminate()).expect("signal terminate to be available");
+    let mut signal_interrupt =
+        signal(SignalKind::interrupt()).expect("signal interrupt to be available");
+
+
+    let signal_tracker_handle = main_tracker.clone();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => {
+                info!("delete completed tasks received cancelled signal");
+                break;
+            },
+            _ = signal_terminate.recv() => {
+                info!("received terminate signal");
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+            },
+            _ = signal_interrupt.recv() => {
+                info!("received interrupt signal");
+                cancellation_token.cancel();
+                signal_tracker_handle.close();
+            },
+            _ = delete_completed_tasks(queue.clone(), main_tracker.clone()) => {
+                time::sleep(Duration::from_secs(60)).await;
+            },
+        }
+    }
+}
+
 #[cfg(windows)]
 pub async fn periodically_delete_completed_tasks<T: Queue + Clone + Send + 'static>(
     queue: T,
