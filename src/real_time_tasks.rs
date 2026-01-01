@@ -51,6 +51,9 @@ pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
                             if let Ok(Some(task)) = worker_queue.get_newest_pending_task().await {
                                 let task_id = task.id();
                                 if let Err(err) = worker_run(task).await {
+                                    if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
+                                        error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
+                                    };
                                     error!("Error processing task with id: {}\nerror: {:?}", task_id, err);
                                 };
                                 if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Completed).await {

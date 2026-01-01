@@ -130,6 +130,9 @@ async fn schedule_stuck_tasks<T: Queue + Clone + Send + 'static>(
                     };
                     let task_id = task.id();
                     if let Err(err) = worker_run(task).await {
+                        if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
+                            error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
+                        };
                         error!(
                             "Error processing task with id: {}\nerror: {:?}",
                             task_id, err
