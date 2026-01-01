@@ -18,6 +18,7 @@ pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>
     cancellation_token: CancellationToken,
 ) {
     use tokio::signal::unix::{signal, SignalKind};
+    use tracing::warn;
 
     let mut signal_terminate =
         signal(SignalKind::terminate()).expect("signal terminate to be available");
@@ -43,7 +44,21 @@ pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>
                 task_tracker_handle.close();
             },
             _ = schedule_stuck_tasks(task_count, queue.clone(), main_tracker.clone()) => {
-                time::sleep(Duration::from_secs(20)).await;
+                let stuck_tasks_count = match queue.get_failed_or_stuck_task_count().await {
+                    Ok(count) => count,
+                    Err(err) => {
+                        error!("Error getting stuck task count\nerror: {:?}", err);
+                        continue;
+                    }
+                };
+
+                if stuck_tasks_count == 0 {
+                    let sleep_length = Duration::from_secs(20);
+                    time::sleep(sleep_length).await;
+                } else {
+                    warn!("Found {} stuck tasks", stuck_tasks_count);
+                }
+
             },
         }
     }

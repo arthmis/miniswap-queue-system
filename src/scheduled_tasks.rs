@@ -55,7 +55,7 @@ pub async fn handle_scheduled_tasks<T>(
                 let pending_scheduled_tasks_count = match queue.pending_scheduled_tasks_count().await {
                     Ok(count) => count,
                     Err(err) => {
-                        error!("Error handling scheduled tasks\nerror: {:?}", err);
+                        error!("Error getting scheduled tasks count\nerror: {:?}", err);
                         continue;
                     }
                 };

@@ -35,6 +35,10 @@ pub trait Queue {
     fn pending_scheduled_tasks_count(
         &self,
     ) -> impl Future<Output = Result<i64, Self::QueueError>> + Send;
+    /// Get count of stuck tasks that were never handled or never completed
+    fn get_failed_or_stuck_task_count(
+        &self,
+    ) -> impl Future<Output = Result<i64, Self::QueueError>> + Send;
     // Questions:
     // Do you need to retain these tasks for audits or anything like that
     // When would you want to delete this data or archive it to keep the disk usage compact?
@@ -219,6 +223,28 @@ impl Queue for PostgresQueue {
         transaction.commit().await?;
 
         Ok(count_affected_rows)
+    }
+
+    async fn get_failed_or_stuck_task_count(
+        &self,
+    ) -> Result<i64, Self::QueueError> {
+
+        let statement = "
+            SELECT COUNT(*) FROM messages
+            WHERE
+                (status = 'in_progress' AND last_started_at IS NOT NULL AND last_started_at < NOW() - INTERVAL '5 minutes')
+                OR (status = 'pending' AND scheduled_at IS NOT NULL AND scheduled_at < NOW() - INTERVAL '5 minutes')
+                OR (status = 'pending' AND scheduled_at IS NULL AND created_at < NOW() - INTERVAL '5 minutes')
+        ";
+
+        let connection = self.get_connection().await?;
+        let row = connection.query_one(statement, &[]).await.map_err(|err| {
+            error!("Failed to query pending scheduled task count: {:?}", err);
+            return err;
+        })?;
+
+        let count = row.get(0);
+        Ok(count)
     }
 }
 
