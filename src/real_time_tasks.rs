@@ -4,7 +4,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use tokio_stream::StreamExt;
 use tracing::error;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::db::Queue;
 use crate::worker_run;
@@ -17,6 +17,7 @@ pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
     mut receiver: UnboundedReceiver<tokio_postgres::AsyncMessage>,
 ) {
     use tokio::signal::unix::{signal, SignalKind};
+    use tracing::warn;
 
     let mut signal_terminate =
         signal(SignalKind::terminate()).expect("signal terminate to be available");
@@ -58,7 +59,7 @@ pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
                             }
                         });
                     },
-                    Some(n) => debug!("{:?}", n),
+                    Some(n) => warn!("Unknown message received: {:?}", n),
                     _ => info!("No notification sent."),
                 };
             },

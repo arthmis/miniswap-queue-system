@@ -1,7 +1,7 @@
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::db::Queue;
 use crate::{db::PostgresQueueError, message::TaskStatus, worker_run};
@@ -32,7 +32,7 @@ pub async fn handle_scheduled_tasks<T>(
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                warn!("scheduled tasks received task cancelled");
+                info!("scheduled tasks received task cancelled");
                 batch_tracker.close();
                 batch_tracker.wait().await;
                 break;

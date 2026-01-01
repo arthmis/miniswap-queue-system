@@ -45,7 +45,7 @@ async fn main() -> Result<(), tokio_postgres::Error> {
         .port(7777)
         .connect_timeout(core::time::Duration::from_secs(10));
 
-    let receiver = setup_realtime_task_listener_channel(config.clone()).await;
+    let (receiver, _client) = setup_realtime_task_listener_channel(config.clone()).await;
 
     let tracker = TaskTracker::new();
     let cancellation_token = CancellationToken::new();
@@ -94,7 +94,9 @@ async fn main() -> Result<(), tokio_postgres::Error> {
     Ok(())
 }
 
-async fn setup_realtime_task_listener_channel(config: Config) -> UnboundedReceiver<AsyncMessage> {
+async fn setup_realtime_task_listener_channel(
+    config: Config,
+) -> (UnboundedReceiver<AsyncMessage>, tokio_postgres::Client) {
     let (sender, receiver) = futures::channel::mpsc::unbounded();
     let (client, mut connection) = config.connect(NoTls).await.unwrap();
 
@@ -104,7 +106,7 @@ async fn setup_realtime_task_listener_channel(config: Config) -> UnboundedReceiv
     tokio::spawn(listen_connection);
 
     client.execute("LISTEN new_task", &[]).await.unwrap();
-    receiver
+    (receiver, client)
 }
 
 pub async fn worker_run(task: TaskPayload) -> Result<(), WorkerError> {
