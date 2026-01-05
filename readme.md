@@ -16,10 +16,9 @@ cargo run --bin miniswap-task
 ```
 
 ## Generating data to simulate the system
-Run the `generate_tasks` binary first before starting the `miniswap-task` binary to get the full usage
+Run the `miniswap-task` queue binary first before starting the `generate_tasks` binary to get the full usage
 You can run `generate_tasks` like this:
 ```
 cargo run --bin generate_tasks
 ```
-This will continuously generate random tasks with payloads into the database. With each insert the `miniswap-task` binary
-will listen for notifications that something was inserted and will launch a task to handle it if it should.
+This will continuously generate and insert random tasks with payloads into the database. With each insert the `miniswap-task` binary will listen for notifications with a payload with the task's id that was inserted. It will launch a task to handle it if it should.
