@@ -129,23 +129,27 @@ async fn schedule_stuck_tasks<T: Queue + Clone + Send + 'static>(
                         return;
                     };
                     let task_id = task.id();
-                    if let Err(err) = worker_run(task).await {
-                        if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
-                            error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
-                        };
-                        error!(
-                            "Error processing task with id: {}\nerror: {:?}",
-                            task_id, err
-                        );
-                    }
-                    if let Err(err) = worker_queue
-                        .update_task_status(task_id, TaskStatus::Completed)
-                        .await
-                    {
-                        error!(
-                            "Error updating task status for task with id: {}\nerror: {:?}",
-                            task_id, err
-                        );
+                    match worker_run(task).await {
+                        Ok(_) => {
+                            if let Err(err) = worker_queue
+                                .update_task_status(task_id, TaskStatus::Completed)
+                                .await
+                            {
+                                error!(
+                                    "Error updating task status for task with id: {}\nerror: {:?}",
+                                    task_id, err
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
+                                error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
+                            };
+                            error!(
+                                "Error processing task with id: {}\nerror: {:?}",
+                                task_id, err
+                            );
+                        }
                     }
                 }
                 Err(err) => error!(

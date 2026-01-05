@@ -7,7 +7,6 @@ use crate::db::Queue;
 use crate::{db::PostgresQueueError, message::TaskStatus, worker_run};
 use tokio::time;
 
-
 #[cfg(unix)]
 pub async fn handle_scheduled_tasks<T>(
     task_count: u32,
@@ -18,13 +17,12 @@ pub async fn handle_scheduled_tasks<T>(
     T: Queue + Clone + Send + 'static,
     PostgresQueueError: From<<T as Queue>::QueueError>,
 {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let mut signal_terminate =
         signal(SignalKind::terminate()).expect("signal terminate to be available");
     let mut signal_interrupt =
         signal(SignalKind::interrupt()).expect("signal interrupt to be available");
-
 
     let batch_tracker = TaskTracker::new();
     let signal_tracker_handle = main_tracker.clone();
@@ -169,24 +167,28 @@ where
         batch_tracker.spawn(async move {
             if let Ok(Some(task)) = worker_queue.get_scheduled_task().await {
                 let task_id = task.id();
-                if let Err(err) = worker_run(task).await {
-                    if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
-                        error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
-                    };
-                    error!(
-                        "Error processing scheduled task with id: {}\nerror: {:?}",
-                        task_id, err
-                    );
-                };
-                if let Err(err) = worker_queue
-                    .update_task_status(task_id, TaskStatus::Completed)
-                    .await
-                {
-                    error!(
-                        "Error updating scheduled task status for task with id: {}\nerror: {:?}",
-                        task_id, err
-                    );
-                };
+                match worker_run(task).await {
+                    Ok(_) => {
+                        if let Err(err) = worker_queue
+                            .update_task_status(task_id, TaskStatus::Completed)
+                            .await
+                        {
+                            error!(
+                                "Error updating scheduled task status for task with id: {}\nerror: {:?}",
+                                task_id, err
+                            );
+                        };
+                    },
+                    Err(err) => {
+                        if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
+                            error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
+                        };
+                        error!(
+                            "Error processing scheduled task with id: {}\nerror: {:?}",
+                            task_id, err
+                        );
+                    }
+                }
             }
         });
     }
