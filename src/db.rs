@@ -13,9 +13,11 @@ use crate::{
 pub trait Queue {
     type QueueError: std::error::Error + Send;
 
-    /// Get the newest pending task that doesn't have a scheduled time
-    fn get_newest_pending_task(
+
+    /// Gets an unscheduled task by its id and marks it as in progress/being processed
+    fn get_task_with_id_for_processing(
         &self,
+        id: i32,
     ) -> impl Future<Output = Result<Option<TaskPayload>, Self::QueueError>> + Send;
     /// Get a task that failed before, the job system has taken too long to complete or never completed
     fn get_failed_or_stuck_task(
@@ -80,11 +82,13 @@ impl PostgresQueue {
 impl Queue for PostgresQueue {
     type QueueError = PostgresQueueError;
 
-    async fn get_newest_pending_task(&self) -> Result<Option<TaskPayload>, Self::QueueError> {
+    async fn get_task_with_id_for_processing(
+        &self,
+        id: i32,
+    ) -> Result<Option<TaskPayload>, Self::QueueError>  {
         let statement = "WITH task AS (
             SELECT * FROM messages
-            WHERE status = 'pending' AND scheduled_at IS NULL
-            ORDER BY priority ASC, created_at DESC
+            WHERE id = $1 AND scheduled_at IS NULL
             FOR UPDATE SKIP LOCKED LIMIT 1
             )
             UPDATE messages SET status = 'in_progress',
@@ -106,7 +110,7 @@ impl Queue for PostgresQueue {
         })?;
 
         let transaction = connection.transaction().await?;
-        let result = transaction.query_opt(statement, &[]).await;
+        let result = transaction.query_opt(statement, &[&id]).await;
 
         let Some(row) = result? else {
             return Ok(None);
@@ -246,6 +250,7 @@ impl Queue for PostgresQueue {
         let count = row.get(0);
         Ok(count)
     }
+
 }
 
 #[derive(Debug)]
@@ -388,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_pending_task_not_scheduled() {
+    async fn test_get_task_by_id_and_not_scheduled() {
         let (_postgres_instance_handle, pool) = start_postgres().await;
         let conn = pool.get().await.unwrap();
         let task_parameters: Vec<TaskGenConfig> = vec![
@@ -414,8 +419,11 @@ mod tests {
 
         let queue = PostgresQueue::new(pool.clone());
 
-        let task = queue.get_newest_pending_task().await.unwrap().unwrap();
+        let task = queue.get_task_with_id_for_processing(1).await.unwrap().unwrap();
         assert_eq!(task.id(), 1);
+
+        let task = queue.get_task_with_id_for_processing(2).await.unwrap();
+        assert!(task.is_none());
     }
 
     #[tokio::test]

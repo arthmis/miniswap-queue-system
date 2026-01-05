@@ -16,7 +16,7 @@ pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
     cancellation_token: CancellationToken,
     mut receiver: UnboundedReceiver<tokio_postgres::AsyncMessage>,
 ) {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     use tracing::warn;
 
     let mut signal_terminate =
@@ -44,12 +44,15 @@ pub async fn handle_tasks_in_real_time<T: Queue + Clone + Send + 'static>(
             },
             message = receiver.next() => {
                 match message {
-                    Some(tokio_postgres::AsyncMessage::Notification(_notification_message)) => {
+                    Some(tokio_postgres::AsyncMessage::Notification(notification_message)) => {
+                        let Ok(task_id) = notification_message.payload().parse::<i32>() else {
+                            warn!("Couldn't parse task id from notification. Payload in notification was: {}", notification_message.payload());
+                            continue;
+                        };
                         let worker_queue = queue.clone();
 
                         main_tracker.spawn(async move {
-                            if let Ok(Some(task)) = worker_queue.get_newest_pending_task().await {
-                                let task_id = task.id();
+                            if let Ok(Some(task)) = worker_queue.get_task_with_id_for_processing(task_id).await {
                                 if let Err(err) = worker_run(task).await {
                                     if let Err(err) = worker_queue.update_task_status(task_id, TaskStatus::Pending).await {
                                         error!("Error updating task status for task with id: {}\nerror: {:?}", task_id, err);
