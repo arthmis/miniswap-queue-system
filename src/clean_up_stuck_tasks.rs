@@ -26,11 +26,14 @@ pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>
         signal(SignalKind::interrupt()).expect("signal interrupt to be available");
 
     let task_tracker_handle = main_tracker.clone();
+    let batch_tracker = TaskTracker::new();
     loop {
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
                 info!("clean up stuck tasks received task cancelled");
+                batch_tracker.close();
+                batch_tracker.wait().await;
                 break;
             },
             _ = signal_terminate.recv() => {
@@ -43,7 +46,7 @@ pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>
                 cancellation_token.cancel();
                 task_tracker_handle.close();
             },
-            _ = schedule_stuck_tasks(task_count, queue.clone(), main_tracker.clone()) => {
+            _ = schedule_stuck_tasks(task_count, queue.clone(), batch_tracker.clone()) => {
                 let stuck_tasks_count = match queue.get_failed_or_stuck_task_count().await {
                     Ok(count) => count,
                     Err(err) => {
@@ -116,13 +119,13 @@ pub async fn handle_failed_and_stuck_messages<T: Queue + Clone + Send + 'static>
 async fn schedule_stuck_tasks<T: Queue + Clone + Send + 'static>(
     task_count: u32,
     queue: T,
-    task_tracker: TaskTracker,
+    batch_tracker: TaskTracker,
 ) {
     info!("scheduling {} tasks for stuck jobs", task_count);
 
     for _ in 0..task_count {
         let worker_queue = queue.clone();
-        task_tracker.spawn(async move {
+        batch_tracker.spawn(async move {
             match worker_queue.get_failed_or_stuck_task().await {
                 Ok(task) => {
                     let Some(task) = task else {
@@ -159,4 +162,7 @@ async fn schedule_stuck_tasks<T: Queue + Clone + Send + 'static>(
             }
         });
     }
+
+    batch_tracker.close();
+    batch_tracker.wait().await;
 }
